@@ -45,8 +45,22 @@ describe("requiredLiteral", () => {
     expect(requiredLiterals(/(?:one|t)wo/)).toBeUndefined();
   });
 
+  it("skips escapes whose tail looks like letters or digits", () => {
+    expect(requiredLiteral(/ignore\x20everything/i)).toBe("everything");
+    expect(requiredLiterals(/​{3,}/)).toBeUndefined();
+    expect(requiredLiteral(/\u{1F600}abc/u)).toBe("abc");
+    expect(requiredLiteral(/\cJabc/)).toBe("abc");
+    expect(requiredLiteral(/(?<word>abc)\k<word>/)).toBe("abc");
+    expect(requiredLiteral(/\p{Letter}abc/u)).toBe("abc");
+  });
+
   it("never claims a literal a match can lack", () => {
     const cases: [RegExp, string[]][] = [
+      [/ignore\x20everything/i, ["ignore everything"]],
+      [/​{3,}/, ["​​​"]],
+      [/Abcdef/, ["Abcdef"]],
+      [/(?<word>abc)\k<word>/, ["abcabc"]],
+      [/\cJabc/, ["\nabc"]],
       [
         /\[?\s*(?:WHITE\s+TEXT|HIDDEN|NOT\s+VISIBLE)\s*/i,
         ["[hidden", "not visible", "white text"],

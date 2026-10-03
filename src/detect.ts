@@ -6,6 +6,7 @@ import { buildLiteralIndex, type LiteralIndex } from "./literal-index";
 import {
   buildViews,
   type DetectNormalizationOptions,
+  ignorableRuns,
   resolveDetectNormalization,
 } from "./normalization";
 
@@ -25,6 +26,12 @@ export interface DetectResult {
    * the classifier is off.
    */
   score?: number;
+  /**
+   * Set when the input was longer than `maxInputLength` (1MB by default) and
+   * only its first `maxInputLength` characters were scanned. The rest may
+   * hold an injection, so treat a truncated result as unchecked.
+   */
+  truncated?: true;
 }
 
 export interface DetectOptions {
@@ -66,6 +73,11 @@ export interface DetectOptions {
       result: DetectResult
     ) => Promise<DetectResult | null>;
   };
+  /**
+   * Characters scanned, 1MB by default, so the cost of a call is bounded.
+   * Longer input is scanned up to this length and the result has
+   * `truncated: true`.
+   */
   maxInputLength?: number;
   /**
    * The built-in classifier, a small model that scores how much the input
@@ -79,7 +91,8 @@ export interface DetectOptions {
    * How readily input counts as an injection. `"strict"` reports low-risk
    * findings and lowers the classifier threshold to 0.35, catching more at
    * the cost of more false positives; `"permissive"` reports only high-risk
-   * findings and raises it to 0.75. Default `"balanced"`. Options you set
+   * findings and raises it to 0.75, counting a classifier detection as high
+   * risk. Default `"balanced"`. Options you set
    * yourself, such as `threshold` or `classifier.threshold`, take precedence.
    */
   sensitivity?: "strict" | "balanced" | "permissive";
@@ -107,6 +120,7 @@ const SENSITIVITY: Record<
 };
 const RE_REGEX_SPECIAL = /[.*+?^${}()|[\]\\]/g;
 const RE_SPACES = /\s+/;
+const RE_UNICODE_FLAGS = /[uv]/;
 
 /** `options` with the sensitivity preset and deny phrases turned into the options they stand for. */
 function resolveOptions(options: DetectOptions): DetectOptions {
@@ -124,35 +138,161 @@ function resolveOptions(options: DetectOptions): DetectOptions {
   if (preset) {
     resolved.threshold = options.threshold ?? preset.threshold;
     if (options.classifier !== false) {
+      const threshold = options.classifier?.threshold ?? preset.classifier;
+      // When only high risk is reported, a classifier detection at the
+      // threshold counts as high risk, or the threshold could never apply.
+      const highThreshold =
+        options.classifier?.highThreshold ??
+        (resolved.threshold === "high" ? threshold : undefined);
       resolved.classifier = {
         ...options.classifier,
-        threshold: options.classifier?.threshold ?? preset.classifier,
+        threshold,
+        highThreshold,
       };
     }
   }
   if (deny.length > 0) {
     resolved.customPatterns = [
       ...(options.customPatterns ?? []),
-      ...deny.map((phrase) => ({
-        category: "deny_phrase",
-        regex: new RegExp(
-          phrase
-            .split(RE_SPACES)
-            .map((word) => word.replace(RE_REGEX_SPECIAL, "\\$&"))
-            .join("\\s+"),
-          "i"
-        ),
-        risk: "high" as const,
-      })),
+      ...deny.flatMap((phrase) =>
+        phraseForms(phrase, options.normalization).map((form) => ({
+          category: "deny_phrase",
+          regex: new RegExp(
+            form
+              .split(RE_SPACES)
+              .map((word) => word.replace(RE_REGEX_SPECIAL, "\\$&"))
+              .join("\\s+"),
+            "i"
+          ),
+          risk: "high" as const,
+        }))
+      ),
     ];
   }
   return resolved;
+}
+
+/**
+ * A deny phrase as written, for the input as written, and normalized like
+ * the input (accents stripped, for one), for the normalized input.
+ */
+function phraseForms(
+  phrase: string,
+  normalization: DetectOptions["normalization"]
+): string[] {
+  const normalized = buildViews(phrase, normalization).text;
+  return normalized === phrase.toLowerCase() ? [phrase] : [phrase, normalized];
 }
 
 interface PatternDef {
   category: string;
   patterns: RegExp[];
   risk: "low" | "medium" | "high" | "critical";
+}
+
+const RE_CURL_COMMAND = /curl\s/gi;
+const RE_CURL_DATA_FLAG =
+  /(?<=\s)(?:-d|--data(?:-binary|-raw|-urlencode)?|-F|--form)\s*/gi;
+const RE_CURL_SECRET =
+  /\$\(|`|\$\{?\w*(?:key|token|secret|pass|env)|printenv|\benv\b|\/etc\/|\.ssh|\.env\b|\.aws/gi;
+/** Longest run of other characters the curl pattern allows between its parts. */
+const CURL_GAP = 200;
+
+/** Start and end offsets of every match of the global regex `re`. */
+function matchOffsets(re: RegExp, text: string): [number[], number[]] {
+  const starts: number[] = [];
+  const ends: number[] = [];
+  re.lastIndex = 0;
+  let m = re.exec(text);
+  while (m) {
+    starts.push(m.index);
+    ends.push(m.index + m[0].length);
+    m = re.exec(text);
+  }
+  return [starts, ends];
+}
+
+/**
+ * Whether `text` has no newline in `[from, to)`. `from` must never decrease
+ * between calls, so the text is searched for newlines only once.
+ */
+function newlineFree(text: string): (from: number, to: number) => boolean {
+  let next = Number.NEGATIVE_INFINITY;
+  return (from, to) => {
+    if (next < from) {
+      const found = text.indexOf("\n", from);
+      next = found < 0 ? Number.POSITIVE_INFINITY : found;
+    }
+    return next >= to;
+  };
+}
+
+/**
+ * The index of the last of the sorted `offsets` at or before `at`, moving
+ * forward from `from`; -1 if there is none.
+ */
+function lastAtOrBefore(offsets: number[], at: number, from: number): number {
+  let i = from;
+  while (i + 1 < offsets.length && offsets[i + 1] <= at) {
+    i++;
+  }
+  return i;
+}
+
+/**
+ * Tests what its source matches, in linear time: `curl`, a data flag after
+ * at most 200 more characters, then command output or a credential after at
+ * most 200 more, with no line break inside either gap. The regex engine
+ * retries the second gap for every flag the first one reaches, which is
+ * quadratic on input such as `curl -F ` repeated. The source stays the
+ * pattern's name in findings and in `excludePatterns`.
+ */
+class CurlDataPattern extends RegExp {
+  constructor() {
+    super(
+      /curl\s[^\n]{0,200}?\s(?:-d|--data(?:-binary|-raw|-urlencode)?|-F|--form)\s*[^\n]{0,200}?(?:\$\(|`|\$\{?\w*(?:key|token|secret|pass|env)|printenv|\benv\b|\/etc\/|\.ssh|\.env\b|\.aws)/i
+        .source,
+      "i"
+    );
+  }
+
+  override test(text: string): boolean {
+    // Each gap is shortest from the latest start before its end, and later
+    // starts only shorten it, so one forward pass per gap is enough.
+    const [, commands] = matchOffsets(RE_CURL_COMMAND, text);
+    if (commands.length === 0) {
+      return false;
+    }
+    const [flags, afterFlags] = matchOffsets(RE_CURL_DATA_FLAG, text);
+    const firstGapFree = newlineFree(text);
+    const reachable: number[] = [];
+    let c = -1;
+    for (let f = 0; f < flags.length; f++) {
+      const space = flags[f] - 1;
+      c = lastAtOrBefore(commands, space, c);
+      if (
+        c >= 0 &&
+        space - commands[c] <= CURL_GAP &&
+        firstGapFree(commands[c], space)
+      ) {
+        reachable.push(afterFlags[f]);
+      }
+    }
+    const [secrets] = matchOffsets(RE_CURL_SECRET, text);
+    const secondGapFree = newlineFree(text);
+    let r = -1;
+    for (const secret of secrets) {
+      r = lastAtOrBefore(reachable, secret, r);
+      if (
+        r >= 0 &&
+        secret - reachable[r] <= CURL_GAP &&
+        secondGapFree(reachable[r], secret)
+      ) {
+        return true;
+      }
+    }
+    return false;
+  }
 }
 
 const PRE_FILTER_SIGNALS = [
@@ -229,8 +369,11 @@ const INJECTION_PATTERNS: PatternDef[] = [
       // jailbreaks. Model presets use this form in place of the one above,
       // which also catches a jailbreak prompt quoting its own trigger.
       /(?<!["“«`]\s{0,2})you\s+are\s+(now\s+)?(DAN|DUDE|STAN|KEVIN|JAILBREAK)\b/i,
-      // Not inside an open quote, as in writing that lists jailbreaks.
-      /(?<!["“«`][^"”»`\n]{0,80})act\s+as\s+(if\s+you\s+are\s+)?(a\s+)?(DAN|unrestricted|evil)/i,
+      // Not inside an open quote, as in writing that lists jailbreaks. The
+      // quote is looked for behind "act as" rather than before it, since
+      // some engines (JavaScriptCore) try a leading lookbehind at every
+      // position of the text.
+      /act\s+as(?<!["“«`][^"”»`\n]{0,80}act\s+as)\s+(if\s+you\s+are\s+)?(a\s+)?(DAN|unrestricted|evil)/i,
       /pretend\s+(to\s+be|you\s+are)\s+(a\s+)?(?:unrestricted|unfiltered|evil)/i,
       /roleplay\s+as\s+(?:a\s+)?(?:hacker|malicious|evil)/i,
       /developer\s+mode\s+(enabled|activated|on)/i,
@@ -273,7 +416,7 @@ const INJECTION_PATTERNS: PatternDef[] = [
     patterns: [
       // curl posting command output, environment variables, or credential
       // files. A plain `curl -d` with a JSON body is an everyday API call.
-      /curl\s[^\n]{0,200}?\s(?:-d|--data(?:-binary|-raw|-urlencode)?|-F|--form)\s*[^\n]{0,200}?(?:\$\(|`|\$\{?\w*(?:key|token|secret|pass|env)|printenv|\benv\b|\/etc\/|\.ssh|\.env\b|\.aws)/i,
+      new CurlDataPattern(),
       /wget\s+-[qQ]?O-?\s+https?:\/\/\S+\s*\|\s*(?:bash|sh)/i,
       /bash\s+-[ci]\s+['"]/i,
       // printenv piped into a local filter only reads the environment.
@@ -412,6 +555,8 @@ const DEFAULT_MAX_INPUT_LENGTH = 1024 * 1024;
 /** Long inputs are scanned in windows this size, overlapping by `WINDOW_OVERLAP`. */
 const WINDOW_SIZE = 8192;
 const WINDOW_OVERLAP = 512;
+/** How many characters a run of padding counts as in a window. */
+const PADDING_WEIGHT = 4;
 const CLASSIFIER_CATEGORY = "classifier";
 
 const RE_WHITESPACE_SPLIT = /\s+/;
@@ -517,12 +662,18 @@ function hasLiteral(text: string, literal: string): boolean {
   return hit;
 }
 
-function testPattern(pattern: RegExp, text: string): boolean {
+/**
+ * Tests `pattern` against `text`, skipping it when a literal it needs is
+ * absent from `lowered` (`text` lowercased) for a case-insensitive pattern,
+ * whose literals are lowercase, or from `text` for any other.
+ */
+function testPattern(pattern: RegExp, text: string, lowered = text): boolean {
   const required = literalsFor(pattern);
   if (required !== null) {
+    const haystack = pattern.ignoreCase ? lowered : text;
     let any = false;
     for (let i = 0; i < required.length && !any; i++) {
-      any = hasLiteral(text, required[i]);
+      any = hasLiteral(haystack, required[i]);
     }
     if (!any) {
       return false;
@@ -532,6 +683,29 @@ function testPattern(pattern: RegExp, text: string): boolean {
   // stateful.
   pattern.lastIndex = 0;
   return pattern.test(text);
+}
+
+/** The last text `testWritten` lowercased, and its lowercase form. */
+let lastWritten: [string, string] | undefined;
+
+/**
+ * Tests a custom pattern against the input as written, which isn't
+ * lowercase like the views. With the `u` or `v` flag, a case-insensitive
+ * pattern also matches `ſ` for `s`, which doesn't lowercase to it, so its
+ * literals aren't checked.
+ */
+function testWritten(pattern: RegExp, text: string): boolean {
+  if (!pattern.ignoreCase) {
+    return testPattern(pattern, text);
+  }
+  if (RE_UNICODE_FLAGS.test(pattern.flags)) {
+    pattern.lastIndex = 0;
+    return pattern.test(text);
+  }
+  if (lastWritten?.[0] !== text) {
+    lastWritten = [text, text.toLowerCase()];
+  }
+  return testPattern(pattern, text, lastWritten[1]);
 }
 
 /**
@@ -645,7 +819,7 @@ function patternMatches(
   // Custom patterns may be case-sensitive or rely on characters that
   // normalization changes, so they also see the text as written.
   return Boolean(
-    def.custom && original !== undefined && testPattern(pattern, original)
+    def.custom && original !== undefined && testWritten(pattern, original)
   );
 }
 
@@ -739,16 +913,53 @@ function compilePatterns(
   return defs;
 }
 
-/** Splits long input into overlapping windows so every part of it is scanned. */
-function windows(text: string): string[] {
-  if (text.length <= WINDOW_SIZE) {
-    return [text];
+/**
+ * Splits long input into overlapping windows so every part of it is scanned.
+ * Their size and overlap count each run of padding (whitespace, invisible,
+ * or combining characters, which normalization collapses or removes) as
+ * `PADDING_WEIGHT` characters, so padding can't push the parts of an
+ * injection into different windows. The windows are cut from the input as
+ * written, so rules see the same text in them as in a short input.
+ */
+function windows(input: string): string[] {
+  if (input.length <= WINDOW_SIZE) {
+    return [input];
   }
+  // Each run of padding, with where it starts when runs count as their weight.
+  const runs: { start: number; end: number; at: number }[] = [];
+  let saved = 0;
+  for (const [start, end] of ignorableRuns(input)) {
+    runs.push({ start, end, at: start - saved });
+    saved += end - start - PADDING_WEIGHT;
+  }
+  /** The offset in `input` of offset `at` counted with runs at their weight. */
+  const offsetOf = (at: number): number => {
+    let low = 0;
+    let high = runs.length;
+    while (low < high) {
+      const middle = (low + high) >> 1;
+      if (runs[middle].at <= at) {
+        low = middle + 1;
+      } else {
+        high = middle;
+      }
+    }
+    const run = runs[low - 1];
+    if (!run) {
+      return at;
+    }
+    const into = at - run.at;
+    return into < PADDING_WEIGHT
+      ? run.start + into
+      : run.end + into - PADDING_WEIGHT;
+  };
+  const length = input.length - saved;
   const out: string[] = [];
   const step = WINDOW_SIZE - WINDOW_OVERLAP;
-  for (let start = 0; start < text.length; start += step) {
-    out.push(text.slice(start, start + WINDOW_SIZE));
-    if (start + WINDOW_SIZE >= text.length) {
+  for (let start = 0; start < length; start += step) {
+    const end = Math.min(start + WINDOW_SIZE, length);
+    out.push(input.slice(offsetOf(start), offsetOf(end)));
+    if (end >= length) {
       break;
     }
   }
@@ -795,6 +1006,9 @@ function scanWindow(window: string, state: ScanState): void {
   }
   if (views.deobfuscatedAlt) {
     primary.push(views.deobfuscatedAlt);
+  }
+  if (views.spaced) {
+    primary.push(views.spaced);
   }
   matchPatterns(primary, state, "", window);
   scoreText(views.deobfuscated, state);
@@ -930,6 +1144,14 @@ export function detect(
     state.findings = state.findings.filter((f) => included.has(f.category));
   }
 
+  const result = resultOf(state);
+  if (bounded.length < input.length) {
+    result.truncated = true;
+  }
+  return result;
+}
+
+function resultOf(state: ScanState): DetectResult {
   if (state.findings.length === 0) {
     return { detected: false, risk: "none", matches: [], score: state.score };
   }
@@ -945,11 +1167,18 @@ export function detect(
   };
 }
 
+/**
+ * What a slower detector returned, or `fallback` when it returned nothing.
+ * Either way the result says when `detect` read only part of the input.
+ */
 async function orElse(
   pending: Promise<DetectResult | null>,
   fallback: DetectResult
 ): Promise<DetectResult> {
-  return (await pending) ?? fallback;
+  const result = (await pending) ?? fallback;
+  return fallback.truncated && !result.truncated
+    ? { ...result, truncated: true }
+    : result;
 }
 
 /**
@@ -1004,8 +1233,16 @@ export interface ConversationDetectOptions extends DetectOptions {
 export interface ConversationDetectResult extends DetectResult {
   /** Messages flagged on their own, by index into the conversation. */
   flagged: Array<{ index: number; role: string; result: DetectResult }>;
-  /** Whether the joined latest user messages were flagged. */
+  /**
+   * Whether the joined latest user messages were flagged for a category no
+   * message was flagged for on its own.
+   */
   splitAcrossTurns: boolean;
+  /**
+   * Set when a message, or the latest user messages joined, was longer
+   * than `maxInputLength` and only partly scanned.
+   */
+  truncated?: true;
 }
 
 const RISK_RANK: Record<DetectResult["risk"], number> = {
@@ -1035,9 +1272,11 @@ export function detectConversation(
   const seen = new Set<string>();
   let risk: DetectResult["risk"] = "none";
   let score = 0;
+  let truncated = false;
 
   const merge = (result: DetectResult, prefix = "") => {
     score = Math.max(score, result.score ?? 0);
+    truncated ||= result.truncated === true;
     if (!result.detected) {
       return;
     }
@@ -1071,7 +1310,7 @@ export function detectConversation(
       .map((m) => m.content);
     if (recent.length > 1) {
       const joined = detect(recent.join("\n"), detectOptions);
-      splitAcrossTurns = joined.detected && flagged.length === 0;
+      splitAcrossTurns = joined.matches.some((m) => !seen.has(m.category));
       merge(joined, "conversation:");
     }
   }
@@ -1083,5 +1322,6 @@ export function detectConversation(
     score,
     flagged,
     splitAcrossTurns,
+    ...(truncated ? { truncated: true as const } : {}),
   };
 }

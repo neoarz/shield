@@ -92,6 +92,12 @@ export interface NormalizedViews {
   deobfuscated: string;
   /** A second leetspeak reading with `1` as `l`, when the text has one. */
   deobfuscatedAlt?: string;
+  /**
+   * `text` with invisible characters between two letters read as a space
+   * instead of removed, when there are any: one zero-width space can
+   * separate two words as well as split one.
+   */
+  spaced?: string;
   /** Text smuggled in Unicode tags or variation selectors, decoded. */
   hidden: HiddenText[];
   signals: ObfuscationSignals;
@@ -125,6 +131,15 @@ const RE_COMBINING =
   /[\u0300-\u036f\u0483-\u0489\u0591-\u05c7\u064b-\u065f\u0670\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f]/g;
 const RE_STACKED_MARKS =
   /[\u0300-\u036f\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff]{2,}/g;
+// The marks after the first 16 of a run. No script stacks more, and
+// Unicode normalization reorders a run in quadratic time.
+const RE_LONG_MARK_RUN = /(\p{M}{16})\p{M}+/gu;
+// Runs of four or more characters that normalization collapses or removes:
+// whitespace, the invisible and combining characters above, and bidi
+// embeddings and isolates. Overrides are left out, since they're counted.
+const RE_IGNORABLE_RUN =
+  // biome-ignore lint/suspicious/noMisleadingCharacterClass: the class lists combining and format characters on purpose, to find or strip them.
+  /[\s\u00ad\u034f\u061c\u115f\u1160\u17b4\u17b5\u180b-\u180f\u200b-\u200f\u2060-\u2065\u206a-\u206f\u3164\uffa0\ufff0-\ufff8\u0300-\u036f\u0483-\u0489\u0591-\u05c7\u064b-\u065f\u0670\u1ab0-\u1aff\u1dc0-\u1dff\u20d0-\u20ff\ufe20-\ufe2f\u202a-\u202c\u2066-\u2069]{4,}/g;
 const RE_WORD = /[\p{L}\p{M}]+/gu;
 const RE_LATIN_LETTER = /[a-z]/;
 const RE_CONFUSABLE_SCRIPT =
@@ -191,9 +206,9 @@ const CONFUSABLES: Record<string, string> = {
 /**
  * Latin letters that NFKC leaves alone but that only style or spoof plain
  * letters (small capitals, IPA look-alikes), plus stroked letters NFD does
- * not decompose. Always folded.
+ * not decompose. Always folded, here and in `sanitize`.
  */
-const LATIN_FOLDS: Record<string, string> = {
+export const LATIN_FOLDS: Record<string, string> = {
   ı: "i",
   ȷ: "j",
   ɑ: "a",
@@ -212,6 +227,7 @@ const LATIN_FOLDS: Record<string, string> = {
   ᴅ: "d",
   ᴇ: "e",
   ғ: "f",
+  ꜰ: "f",
   ᴊ: "j",
   ᴋ: "k",
   ᴍ: "m",
@@ -465,6 +481,18 @@ function foldMixedScriptWords(
   });
 }
 
+/**
+ * The runs of four or more whitespace, invisible, or combining characters
+ * in `input`, as `[start, end)` offsets. Normalization collapses or removes
+ * them, so they barely add to the length of the text rules see.
+ */
+export function ignorableRuns(input: string): [number, number][] {
+  return Array.from(input.matchAll(RE_IGNORABLE_RUN), (match) => {
+    const start = match.index ?? 0;
+    return [start, start + match[0].length];
+  });
+}
+
 function collapseWhitespace(input: string): string {
   return input.replace(RE_WS_RUN, " ").replace(RE_NEWLINE_RUN, "\n").trim();
 }
@@ -504,7 +532,11 @@ function normalizeUnicode(
     text = text.replace(RE_BIDI, "").replace(RE_INVISIBLE, "");
   }
 
-  const decomposed = text.normalize("NFKC").toLowerCase().normalize("NFD");
+  const decomposed = text
+    .replace(RE_LONG_MARK_RUN, "$1")
+    .normalize("NFKC")
+    .toLowerCase()
+    .normalize("NFD");
   signals.stackedMarks = countMatches(RE_STACKED_MARKS, decomposed);
   text = decomposed.replace(RE_COMBINING, "").normalize("NFC");
 
@@ -781,13 +813,22 @@ export function buildViews(
 
   const hidden: HiddenText[] = [];
   const text = normalizeUnicode(input, config, signals, hidden);
+  const spaced =
+    signals.invisibleInWords > 0
+      ? normalizeUnicode(
+          input.replace(RE_INVISIBLE_IN_WORD, (run: string) => `${run[0]} `),
+          config,
+          emptySignals(),
+          []
+        )
+      : undefined;
   const anyDeobfuscation =
     config.joinSeparatedLetters ||
     config.decodeLeetspeak ||
     config.repairTypos ||
     config.repairPhonetics;
   if (!anyDeobfuscation) {
-    return { text, deobfuscated: text, hidden, signals };
+    return { text, deobfuscated: text, spaced, hidden, signals };
   }
   const { text: deobfuscated, alt: deobfuscatedAlt } = deobfuscate(
     text,
@@ -797,6 +838,7 @@ export function buildViews(
     text,
     deobfuscated,
     deobfuscatedAlt,
+    spaced,
     hidden,
     signals,
   };

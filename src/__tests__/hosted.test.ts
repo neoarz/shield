@@ -343,6 +343,50 @@ describe("hosted detection", () => {
     expect(vi.getTimerCount()).toBe(0);
   });
 
+  it.each([
+    [
+      "a fetch that ignores the abort signal",
+      (): Promise<Response> => new Promise(() => undefined),
+    ],
+    [
+      "a response body that ignores the abort signal",
+      async (): Promise<Response> =>
+        new Response(
+          new ReadableStream({
+            start(controller) {
+              controller.enqueue(new TextEncoder().encode("{"));
+            },
+          })
+        ),
+    ],
+  ])("times out %s", async (_, fetcher) => {
+    vi.useFakeTimers();
+    const pending = detect(TEXT, {
+      apiKey: API_KEY,
+      fetch: vi.fn<typeof fetch>().mockImplementation(fetcher),
+      timeoutMs: 25,
+    });
+    const assertion = expect(pending).rejects.toMatchObject({
+      code: "SHIELD_TIMEOUT",
+    });
+    await vi.advanceTimersByTimeAsync(25);
+    await assertion;
+    expect(vi.getTimerCount()).toBe(0);
+  });
+
+  it("cancels a request whose fetch ignores the abort signal", async () => {
+    const controller = new AbortController();
+    const pending = detect(TEXT, {
+      apiKey: API_KEY,
+      signal: controller.signal,
+      fetch: vi
+        .fn<typeof fetch>()
+        .mockImplementation(() => new Promise(() => undefined)),
+    });
+    controller.abort();
+    await expect(pending).rejects.toMatchObject({ code: "SHIELD_ABORTED" });
+  });
+
   it("keeps explicit local detection synchronous and offline", () => {
     const fetcher = vi.fn<typeof fetch>();
     vi.stubGlobal("fetch", fetcher);

@@ -282,6 +282,20 @@ async function discardResponse(response: Response): Promise<void> {
   }
 }
 
+/** Settles like `work`, or rejects once `signal` aborts, even if `work` ignores the signal. */
+function untilAborted<T>(work: Promise<T>, signal: AbortSignal): Promise<T> {
+  return new Promise<T>((resolve, reject) => {
+    const abort = (): void => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    if (signal.aborted) {
+      abort();
+    }
+    work
+      .then(resolve, reject)
+      .finally(() => signal.removeEventListener("abort", abort));
+  });
+}
+
 function validateRequest(input: string, options: HostedRequestOptions): number {
   if (typeof input !== "string" || input.length === 0) {
     throw configurationError("Shield requires a nonempty string input.");
@@ -328,24 +342,27 @@ async function request(
         "SHIELD_ABORTED"
       );
     }
-    const response = await fetcher(url.href, {
-      method: "POST",
-      headers: {
-        "Content-Type": "application/json",
-        ...(key ? { Authorization: `Bearer ${key}` } : {}),
-      },
-      body: JSON.stringify({ model, input }),
-      signal: controller.signal,
-      redirect: "manual",
-      credentials: "omit",
-    });
+    const response = await untilAborted(
+      fetcher(url.href, {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          ...(key ? { Authorization: `Bearer ${key}` } : {}),
+        },
+        body: JSON.stringify({ model, input }),
+        signal: controller.signal,
+        redirect: "manual",
+        credentials: "omit",
+      }),
+      controller.signal
+    );
     if (!response.ok) {
       discardResponse(response);
       throw httpError(response.status);
     }
     let data: unknown;
     try {
-      data = await response.json();
+      data = await untilAborted(response.json(), controller.signal);
     } catch {
       throw invalidResponse();
     }

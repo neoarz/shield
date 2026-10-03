@@ -66,6 +66,47 @@ function skipQuantifier(src: string, i: number): number {
   return j;
 }
 
+const RE_HEX_DIGIT = /[0-9a-fA-F]/;
+const RE_DIGIT = /[0-9]/;
+
+/** Index just past `close` at or after `from`, or `from` if it's not there. */
+function pastClose(src: string, from: number, close: string): number {
+  const end = src.indexOf(close, from);
+  return end < 0 ? from : end + 1;
+}
+
+/**
+ * Index just past the escape that starts at `start`, including the digits,
+ * braces, or name of `\xHH`, `\uHHHH`, `\u{H…}`, `\cX`, `\p{…}`, `\k<…>`,
+ * and backreferences, which aren't literal text.
+ */
+function escapeEnd(src: string, start: number): number {
+  const kind = src[start + 1];
+  let i = start + 2;
+  if (kind === "x" || (kind === "u" && src[i] !== "{")) {
+    const max = i + (kind === "x" ? 2 : 4);
+    while (i < max && RE_HEX_DIGIT.test(src[i] ?? "")) {
+      i++;
+    }
+    return i;
+  }
+  if ((kind === "u" || kind === "p" || kind === "P") && src[i] === "{") {
+    return pastClose(src, i, "}");
+  }
+  if (kind === "k" && src[i] === "<") {
+    return pastClose(src, i, ">");
+  }
+  if (kind === "c") {
+    return i + 1;
+  }
+  if (RE_DIGIT.test(kind ?? "")) {
+    while (RE_DIGIT.test(src[i] ?? "")) {
+      i++;
+    }
+  }
+  return i;
+}
+
 /** Splits `src` at its top-level `|`. */
 function branches(src: string): string[] {
   const out: string[] = [];
@@ -117,7 +158,7 @@ function branchRequirement(
     const ch = src[i];
     if (ch === "\\") {
       endRun();
-      i += 2;
+      i = escapeEnd(src, i);
       if (isQuantifier(src[i])) {
         i = skipQuantifier(src, i);
       }

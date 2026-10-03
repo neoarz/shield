@@ -47,8 +47,10 @@ const RE_BASE64 = /[A-Za-z0-9+/_-]{16,}={0,2}/g;
 const RE_HAS_UPPER = /[A-Z]/;
 const RE_HAS_LOWER = /[a-z]/;
 const RE_HAS_DIGIT_OR_SYMBOL = /[0-9+/_-]/;
+// Bytes may be separated by a space, colon, or dash, or by a comma and any
+// spacing, as in C arrays (`0x69, 0x67,` and line breaks from `xxd -i`).
 const RE_HEX_RUN =
-  /(?:\\x|0x)?[0-9a-fA-F]{2}(?:[ :,-]?(?:\\x|0x)?[0-9a-fA-F]{2}){7,}/g;
+  /(?:\\x|0x)?[0-9a-fA-F]{2}(?:(?:,[ \t\r\n]*|[ :-])?(?:\\x|0x)?[0-9a-fA-F]{2}){7,}/g;
 const RE_HEX_PAIR = /[0-9a-fA-F]{2}/g;
 const RE_HEX_PREFIX = /\\x|0x/g;
 const RE_BINARY_RUN = /(?:[01]{8}[ ,]?){6,}/g;
@@ -73,7 +75,8 @@ const RE_BRAILLE_ANY = /[\u2801-\u28ff]/;
 const RE_MORSE_WORD_BREAK = / \/ | {3}|\//;
 const RE_MORSE_LETTER_BREAK = / +/;
 const RE_BRAILLE_RUN = /[\u2801-\u28ff][\u2800-\u28ff]{3,}/g;
-const RE_LETTER_OR_SPACE = /[\p{L}\p{N}\s.,'"!?:;()-]/u;
+// Marks too: vowel signs in Indic and Thai text are combining marks.
+const RE_LETTER_OR_SPACE = /[\p{L}\p{M}\p{N}\s.,'"!?:;()-]/u;
 
 const NAMED_ENTITIES: Record<string, string> = {
   lt: "<",
@@ -262,7 +265,23 @@ function looksLikeText(text: string): boolean {
   return readable >= 0.9 && letters >= 0.5;
 }
 
-function decodeBase64(candidate: string): string | undefined {
+/** `bytes` without a UTF-8 sequence cut short at the end. */
+function wholeUtf8(bytes: Uint8Array): Uint8Array {
+  for (let back = 1; back <= Math.min(3, bytes.length); back++) {
+    const byte = bytes[bytes.length - back];
+    if ((byte & 0xc0) !== 0x80) {
+      const length = byte >= 0xf0 ? 4 : byte >= 0xe0 ? 3 : byte >= 0xc0 ? 2 : 1;
+      return length > back ? bytes.subarray(0, bytes.length - back) : bytes;
+    }
+  }
+  return bytes;
+}
+
+/**
+ * Decodes base64 into text. A `prefix` of a longer candidate may end inside
+ * a multibyte character, which is dropped instead of read as an error.
+ */
+function decodeBase64(candidate: string, prefix = false): string | undefined {
   let s = candidate
     .replace(RE_TRAILING_EQUALS, "")
     .replace(RE_DASH, "+")
@@ -283,16 +302,7 @@ function decodeBase64(candidate: string): string | undefined {
   for (let i = 0; i < binary.length; i++) {
     bytes[i] = binary.charCodeAt(i);
   }
-  return bytesToText(bytes);
-}
-
-function hasStrongHint(text: string, original: string): boolean {
-  for (const hint of STRONG_HINTS) {
-    if (text.includes(hint) && !original.includes(hint)) {
-      return true;
-    }
-  }
-  return false;
+  return bytesToText(prefix ? wholeUtf8(bytes) : bytes);
 }
 
 // Character classes for finding candidate spans in one pass over the text.
@@ -312,7 +322,7 @@ function addClass(chars: string, flag: number): void {
 const DIGITS = "0123456789";
 const LOWER = "abcdefghijklmnopqrstuvwxyz";
 addClass(`${DIGITS}${LOWER}${LOWER.toUpperCase()}+/_-=`, BASE64_CHAR);
-addClass(`${DIGITS}abcdefABCDEFxX :,-\\`, HEX_CHAR);
+addClass(`${DIGITS}abcdefABCDEFxX :,-\\\t\r\n`, HEX_CHAR);
 addClass("01 ,", BINARY_CHAR);
 addClass(`${DIGITS} ,`, DECIMAL_CHAR);
 addClass(".-_ /", MORSE_CHAR);
@@ -402,7 +412,7 @@ function decodeBase64Spans(
       RE_HAS_LOWER.test(candidate) &&
       (RE_HAS_UPPER.test(candidate) || RE_HAS_DIGIT_OR_SYMBOL.test(candidate));
     // Check a prefix first so long binary blobs (images) are rejected cheaply.
-    if (plausible && decodeBase64(candidate.slice(0, 24)) !== undefined) {
+    if (plausible && decodeBase64(candidate.slice(0, 24), true) !== undefined) {
       const text = decodeBase64(candidate);
       if (text) {
         out.push({ encoding: "base64", text, start, end });
@@ -418,8 +428,9 @@ function decodeHexSpans(
 ): void {
   eachMatchInSpans(raw, spans, RE_HEX_RUN, out, (run, start, end) => {
     const pairs = run.replace(RE_HEX_PREFIX, "").match(RE_HEX_PAIR) ?? [];
-    // Each byte of hex-encoded text starts with a digit, so runs that are
-    // mostly letters (a-f) can't be text.
+    // Each byte of ASCII text starts with a digit in hex. Runs that are
+    // mostly letters (a-f) are text only as multibyte UTF-8, such as Hindi or
+    // Korean, which hashes and IDs almost never decode as without an error.
     let digitLeads = 0;
     for (const p of pairs) {
       const c = p.charCodeAt(0);
@@ -427,13 +438,11 @@ function decodeHexSpans(
         digitLeads++;
       }
     }
-    if (digitLeads < pairs.length * 0.9) {
-      return;
-    }
     const text = bytesToText(
       new Uint8Array(pairs.map((p) => Number.parseInt(p, 16)))
     );
-    if (text) {
+    const ascii = digitLeads >= pairs.length * 0.9;
+    if (text && (ascii || !text.includes("�"))) {
       out.push({ encoding: "hex", text, start, end });
     }
   });
@@ -495,6 +504,13 @@ function safeCodePoint(code: number): string {
   return code > 0 && code <= 0x10_ff_ff ? String.fromCodePoint(code) : "";
 }
 
+/** As browsers do: NUL, surrogates, and values past U+10FFFF become U+FFFD. */
+function entityCodePoint(code: number): string {
+  return code === 0 || (code >= 0xd8_00 && code <= 0xdf_ff) || code > 0x10_ff_ff
+    ? "\ufffd"
+    : String.fromCodePoint(code);
+}
+
 function decodeEntities(raw: string, out: DecodedPayload[]): void {
   RE_ENTITY.lastIndex = 0;
   let count = 0;
@@ -508,10 +524,10 @@ function decodeEntities(raw: string, out: DecodedPayload[]): void {
     RE_ENTITY,
     (_m: string, hex?: string, dec?: string, named?: string) => {
       if (hex) {
-        return safeCodePoint(Number.parseInt(hex, 16));
+        return entityCodePoint(Number.parseInt(hex, 16));
       }
       if (dec) {
-        return safeCodePoint(Number.parseInt(dec, 10));
+        return entityCodePoint(Number.parseInt(dec, 10));
       }
       return NAMED_ENTITIES[named ?? ""] ?? "";
     }
@@ -611,21 +627,18 @@ export function decodePayloads(
     decodeBraille(raw, out);
   }
 
+  // No hint reads as a hint again after ROT13, reversal, or flipping, so a
+  // hint in the transformed text came from transformed text, even when the
+  // plain text uses the same word.
   if (normalized.length <= MAX_CANDIDATE_LENGTH) {
     if (containsAny(normalized, ROT13_HINTS)) {
-      const r13 = rot13(normalized);
-      if (hasStrongHint(r13, normalized)) {
-        out.push({ encoding: "rot13", text: r13 });
-      }
+      out.push({ encoding: "rot13", text: rot13(normalized) });
     }
     if (containsAny(normalized, REVERSED_HINTS)) {
-      const reversed = reverse(normalized);
-      if (hasStrongHint(reversed, normalized)) {
-        out.push({ encoding: "reversed", text: reversed });
-      }
+      out.push({ encoding: "reversed", text: reverse(normalized) });
     }
     const unflipped = unflipText(normalized);
-    if (unflipped && hasStrongHint(unflipped, normalized)) {
+    if (unflipped && containsAny(unflipped, STRONG_HINTS)) {
       out.push({ encoding: "upside_down", text: unflipped });
     }
   }

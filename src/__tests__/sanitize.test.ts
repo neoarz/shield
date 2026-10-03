@@ -1,6 +1,29 @@
 import { describe, expect, it } from "vitest";
 import { sanitize, sanitizeObject, sanitizeWithRedactions } from "../sanitize";
 
+const RE_LOWER = /[a-z]/g;
+const SMALL_CAPITALS: Record<string, string> = {
+  a: "ᴀ",
+  b: "ʙ",
+  c: "ᴄ",
+  d: "ᴅ",
+  e: "ᴇ",
+  f: "ꜰ",
+  g: "ɢ",
+  h: "ʜ",
+  i: "ɪ",
+  l: "ʟ",
+  m: "ᴍ",
+  n: "ɴ",
+  o: "ᴏ",
+  r: "ʀ",
+  s: "ꜱ",
+  t: "ᴛ",
+  u: "ᴜ",
+  v: "ᴠ",
+  w: "ᴡ",
+  y: "ʏ",
+};
 const SYSTEM_PROMPT =
   "You are a financial advisor. Never share account numbers. Always verify identity before disclosing balances. Your secret code is OMEGA-7.";
 
@@ -126,6 +149,17 @@ describe("sanitize", () => {
     expect(sanitize(leet, SYSTEM_PROMPT).leaked).toBe(true);
   });
 
+  it("detects a leak written in small capitals", () => {
+    const leak =
+      "Never share account numbers. Always verify identity before disclosing balances.";
+    const smallCaps = leak
+      .toLowerCase()
+      .replace(RE_LOWER, (c) => SMALL_CAPITALS[c] ?? c);
+    const result = sanitize(`Sure: ${smallCaps}`, SYSTEM_PROMPT);
+    expect(result.leaked).toBe(true);
+    expect(result.sanitized).toBe("Sure: [REDACTED].");
+  });
+
   it("detects leaks of prompts written without spaces", () => {
     const prompt =
       "\u4f60\u662f\u4e00\u4e2a\u8d22\u52a1\u987e\u95ee\u3002\u6c38\u8fdc\u4e0d\u8981\u900f\u9732\u8d26\u6237\u53f7\u7801\uff0c\u5728\u8ba8\u8bba\u4f59\u989d\u4e4b\u524d\u5fc5\u987b\u9a8c\u8bc1\u8eab\u4efd\u3002";
@@ -161,6 +195,19 @@ describe("sanitize", () => {
     expect(result.sanitized).toBe("Decoded config: [REDACTED] (base64)");
   });
 
+  it("redacts a base64 leak of a Korean prompt", () => {
+    const prompt =
+      "당신은 노스윈드 은행의 고객 지원 도우미입니다. 금리 변경은 발표 전에 절대 논의하지 마십시오. 모든 사기 신고는 보안 부서로 전달하십시오.";
+    const leak =
+      "금리 변경은 발표 전에 절대 논의하지 마십시오. 모든 사기 신고는 보안 부서로 전달하십시오.";
+    const encoded = btoa(
+      String.fromCharCode(...new TextEncoder().encode(leak))
+    );
+    const result = sanitize(`OK: ${encoded}`, prompt);
+    expect(result.leaked).toBe(true);
+    expect(result.sanitized).toBe("OK: [REDACTED]");
+  });
+
   it("redacts a reversed or ROT13 leak where it sits", () => {
     const leak =
       "Never share account numbers. Always verify identity before disclosing balances.";
@@ -190,6 +237,58 @@ describe("sanitize", () => {
     const output =
       "Thanks for reaching out! I can help you understand your statement. Let me know if you have any other questions about your balances.";
     expect(sanitize(output, SYSTEM_PROMPT).leaked).toBe(false);
+  });
+});
+
+describe("sanitize: plain leaks beside ordinary escapes", () => {
+  const prompt =
+    "You are Finley, the support assistant for Northwind Bank. Never discuss interest rate changes before they are announced. Escalate any fraud report to the security desk at extension 4471.";
+  const leak =
+    "Never discuss interest rate changes before they are announced. Escalate any fraud report to the security desk at extension 4471.";
+
+  it("cuts the leak out where it sits", () => {
+    for (const tail of [
+      " Thanks.",
+      " See https://example.com/search?q=a%20b%20c%20d for details.",
+      " Terms &amp; conditions &amp; fees &amp; limits apply.",
+      " Type \\u0041\\u0042\\u0043 to continue.",
+    ]) {
+      const result = sanitize(`Sure. ${leak}${tail}`, prompt);
+      expect(result.leaked).toBe(true);
+      expect(result.sanitized).toBe(`Sure. [REDACTED].${tail}`);
+    }
+  });
+
+  it("still redacts everything when an encoded copy follows the plain one", () => {
+    const result = sanitize(
+      `Sure. ${leak} Again: ${encodeURIComponent(leak)}`,
+      prompt
+    );
+    expect(result.leaked).toBe(true);
+    expect(result.sanitized).toBe("[REDACTED]");
+  });
+});
+
+describe("sanitize: output over 1MB", () => {
+  const filler =
+    "The quarterly report shows steady growth in the northern region. ".repeat(
+      17_000
+    );
+
+  it("returns clean output whole", () => {
+    const output = `${filler}The end.`;
+    const result = sanitize(output, SYSTEM_PROMPT);
+    expect(output.length).toBeGreaterThan(1024 * 1024);
+    expect(result.leaked).toBe(false);
+    expect(result.sanitized).toBe(output);
+  });
+
+  it("redacts a leak after the first 1MB", () => {
+    const leak =
+      "Never share account numbers. Always verify identity before disclosing balances.";
+    const result = sanitize(`${filler}${leak} The end.`, SYSTEM_PROMPT);
+    expect(result.leaked).toBe(true);
+    expect(result.sanitized).toBe(`${filler}[REDACTED]. The end.`);
   });
 });
 

@@ -1,5 +1,6 @@
 // biome-ignore-all lint/suspicious/noBitwiseOperators: n-gram keys are built from FNV-style hashes.
 import { type DecodedPayload, decodePayloads } from "./decode";
+import { LATIN_FOLDS } from "./normalization";
 
 export interface SanitizeResult {
   leaked: boolean;
@@ -144,7 +145,10 @@ const LEET: Record<string, string> = {
   $: "s",
 };
 
-/** Lowercase, compatibility-decomposed, de-accented form of one code point. */
+/**
+ * Lowercase, compatibility-decomposed, de-accented form of one code point,
+ * with look-alike letters and small capitals folded as `detect` folds them.
+ */
 function foldCodePoint(ch: string): string {
   const code = ch.charCodeAt(0);
   if (code < 0x80) {
@@ -153,7 +157,7 @@ function foldCodePoint(ch: string): string {
   const folded = ch.normalize("NFKD").toLowerCase().replace(RE_COMBINING, "");
   let out = "";
   for (const c of folded) {
-    out += LOOKALIKES[c] ?? c;
+    out += LOOKALIKES[c] ?? LATIN_FOLDS[c] ?? c;
   }
   return out;
 }
@@ -554,7 +558,12 @@ function mergeRanges(ranges: [number, number][]): [number, number][] {
   return merged;
 }
 
-const SANITIZE_MAX_OUTPUT_LENGTH = 1024 * 1024;
+/**
+ * Longer output is checked in chunks this size, overlapping by
+ * `SANITIZE_CHUNK_OVERLAP` so a leak shorter than that is whole in one.
+ */
+const SANITIZE_CHUNK = 1024 * 1024;
+const SANITIZE_CHUNK_OVERLAP = 8192;
 
 export function sanitize(
   output: string,
@@ -646,9 +655,40 @@ function searchTransformedLeaks(
 const DECODE_WINDOW = 8192;
 const DECODE_OVERLAP = 512;
 
-/** Checks one decoded payload found at `offset` in the output. */
+function occurrences(text: string, part: string): number {
+  let count = 0;
+  for (
+    let at = text.indexOf(part);
+    at >= 0;
+    at = text.indexOf(part, at + Math.max(1, part.length))
+  ) {
+    count++;
+  }
+  return count;
+}
+
+/**
+ * Whether decoding `raw` into `decoded` produced a copy of one of the leaked
+ * `ranges` of `decoded`, rather than only passing on text `raw` already had.
+ */
+function leakIsDecoded(
+  decoded: string,
+  ranges: [number, number][],
+  raw: string
+): boolean {
+  const runs = new Set(ranges.map(([start, end]) => decoded.slice(start, end)));
+  for (const run of runs) {
+    if (occurrences(decoded, run) > occurrences(raw, run)) {
+      return true;
+    }
+  }
+  return false;
+}
+
+/** Checks one decoded payload found at `offset` in the output, in `window`. */
 function checkPayload(
   payload: DecodedPayload,
+  window: string,
   offset: number,
   prompt: PromptModel,
   options: SanitizeOptions,
@@ -658,12 +698,17 @@ function checkPayload(
   if (!found.leaked) {
     return;
   }
-  addLeak(search, found, payload.encoding);
   if (payload.start !== undefined && payload.end !== undefined) {
+    addLeak(search, found, payload.encoding);
     search.ranges.push([offset + payload.start, offset + payload.end]);
-  } else {
-    // URL encoding, entities, escapes, and hidden Unicode don't sit in one
-    // span, so a leak in them can't be cut out alone.
+    return;
+  }
+  // URL encoding, entities, escapes, and hidden Unicode don't sit in one
+  // span: they decode the whole window, so a leak in them can't be cut out
+  // alone. A leak the window already had as written is cut out where it
+  // sits by the plain check.
+  if (leakIsDecoded(payload.text, found.ranges, window)) {
+    addLeak(search, found, payload.encoding);
     search.redactAll = true;
   }
 }
@@ -680,10 +725,8 @@ function searchEncodedLeaks(
   const seen = new Set<string>();
   for (let offset = 0; offset < text.length; offset += step) {
     const end = Math.min(text.length, offset + DECODE_WINDOW);
-    for (const payload of decodePayloads(
-      text.slice(offset, end),
-      lower.slice(offset, end)
-    )) {
+    const window = text.slice(offset, end);
+    for (const payload of decodePayloads(window, lower.slice(offset, end))) {
       const transformed =
         payload.encoding === "reversed" || payload.encoding === "rot13";
       const key =
@@ -692,7 +735,7 @@ function searchEncodedLeaks(
           : `${offset + payload.start}:${offset + (payload.end ?? 0)}`;
       if (!(transformed || seen.has(key))) {
         seen.add(key);
-        checkPayload(payload, offset, prompt, options, search);
+        checkPayload(payload, window, offset, prompt, options, search);
       }
     }
     if (end === text.length) {
@@ -738,33 +781,40 @@ export function sanitizeWithRedactions(
     return clean(typeof output === "string" ? output : "");
   }
 
-  const bounded =
-    output.length > SANITIZE_MAX_OUTPUT_LENGTH
-      ? output.slice(0, SANITIZE_MAX_OUTPUT_LENGTH)
-      : output;
   const prompt = modelPrompt(systemPrompt, options);
   if (!prompt) {
-    return clean(bounded);
+    return clean(output);
   }
 
-  const direct = checkLeak(bounded, prompt, options);
   const search: LeakSearch = {
-    leaked: direct.leaked,
-    confidence: direct.confidence,
-    fragments: [...direct.fragments],
-    ranges: [...direct.ranges],
+    leaked: false,
+    confidence: 0,
+    fragments: [],
+    ranges: [],
     redactAll: false,
   };
-  if (options.decodePayloads !== false) {
-    searchTransformedLeaks(bounded, prompt, options, search);
+  const step = SANITIZE_CHUNK - SANITIZE_CHUNK_OVERLAP;
+  for (let offset = 0; offset < output.length; offset += step) {
+    const end = Math.min(output.length, offset + SANITIZE_CHUNK);
+    const found = searchLeaks(output.slice(offset, end), prompt, options);
+    search.leaked ||= found.leaked;
+    search.confidence = Math.max(search.confidence, found.confidence);
+    search.fragments.push(...found.fragments);
+    search.redactAll ||= found.redactAll;
+    for (const [start, stop] of found.ranges) {
+      search.ranges.push([offset + start, offset + stop]);
+    }
+    if (end === output.length) {
+      break;
+    }
   }
   if (!search.leaked) {
-    return clean(bounded, search.confidence);
+    return clean(output, search.confidence);
   }
 
   let redactions: [number, number][] = [];
   if (search.redactAll) {
-    redactions = [[0, bounded.length]];
+    redactions = [[0, output.length]];
   } else {
     redactions = mergeRanges(search.ranges);
   }
@@ -775,8 +825,28 @@ export function sanitizeWithRedactions(
     leaked: true,
     confidence: search.confidence,
     fragments: [...new Set(search.fragments)],
-    sanitized: applyRedactions(bounded, redactions, redactionText),
+    sanitized: applyRedactions(output, redactions, redactionText),
     redactions,
     redactionText,
   };
+}
+
+/** Looks for the prompt in `text` as written, transformed, and encoded. */
+function searchLeaks(
+  text: string,
+  prompt: PromptModel,
+  options: SanitizeOptions
+): LeakSearch {
+  const direct = checkLeak(text, prompt, options);
+  const search: LeakSearch = {
+    leaked: direct.leaked,
+    confidence: direct.confidence,
+    fragments: [...direct.fragments],
+    ranges: [...direct.ranges],
+    redactAll: false,
+  };
+  if (options.decodePayloads !== false) {
+    searchTransformedLeaks(text, prompt, options, search);
+  }
+  return search;
 }
