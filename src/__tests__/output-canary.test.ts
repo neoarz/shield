@@ -1,9 +1,11 @@
 import { afterEach, describe, expect, it, vi } from "vitest";
+import { ShieldError } from "../errors";
 import { canaryInstruction, createCanary, findCanary } from "../output/canary";
 
 const CANARY_FORMAT = /^ZL-CANARY-[0-9a-f]{16}$/;
 const ACME_FORMAT = /^ACME-CANARY-[0-9a-f]{8}$/;
 const MISSING_CRYPTO = /getRandomValues/;
+const NODE_18_FLAG = /--experimental-global-webcrypto/;
 const HYPHENS = /-/g;
 const PAIRS = /../g;
 
@@ -11,6 +13,38 @@ function hex(value: string): string {
   return Array.from(value, (c) =>
     c.charCodeAt(0).toString(16).padStart(2, "0")
   ).join("");
+}
+
+/** Maps ASCII letters and digits into another Unicode alphabet, leaving the rest. */
+function remap(
+  value: string,
+  upper: number,
+  lower: number,
+  digits: (d: number) => number
+): string {
+  return Array.from(value, (c) => {
+    const code = c.charCodeAt(0);
+    if (code >= 65 && code <= 90) {
+      return String.fromCodePoint(upper + code - 65);
+    }
+    if (code >= 97 && code <= 122) {
+      return String.fromCodePoint(lower + code - 97);
+    }
+    if (code >= 48 && code <= 57) {
+      return String.fromCodePoint(digits(code - 48));
+    }
+    return c;
+  }).join("");
+}
+
+function mathBold(value: string): string {
+  return remap(value, 0x1_d4_00, 0x1_d4_1a, (d) => 0x1_d7_ce + d);
+}
+
+function circled(value: string): string {
+  return remap(value, 0x24_b6, 0x24_d0, (d) =>
+    d === 0 ? 0x24_ea : 0x24_60 + d - 1
+  );
 }
 
 function kinds(text: string, canary: string): string[] {
@@ -48,6 +82,15 @@ describe("createCanary", () => {
   it("throws a clear error without Web Crypto instead of using a weak source", () => {
     vi.stubGlobal("crypto", undefined);
     expect(() => createCanary()).toThrow(MISSING_CRYPTO);
+  });
+
+  it("gives the missing Web Crypto error a stable code", () => {
+    vi.stubGlobal("crypto", undefined);
+    expect(() => createCanary()).toThrow(ShieldError);
+    expect(() => createCanary()).toThrow(
+      expect.objectContaining({ code: "CRYPTO_UNAVAILABLE" })
+    );
+    expect(() => createCanary()).toThrow(NODE_18_FLAG);
   });
 });
 
@@ -112,6 +155,9 @@ describe("findCanary", () => {
         ).join(""),
       "obfuscated",
     ],
+    ["math bold", mathBold, "obfuscated"],
+    ["math bold tail", (c) => mathBold(c.slice(10)), "obfuscated"],
+    ["circled", circled, "obfuscated"],
     ["reversed", (c) => c.split("").reverse().join(""), "reversed"],
     [
       "reversed tail",
@@ -134,6 +180,12 @@ describe("findCanary", () => {
       "base64",
     ],
     ["hex", (c) => hex(c), "hex"],
+    ["hex of upper case", (c) => hex(c.toUpperCase()), "hex"],
+    [
+      "hex of the upper-case tail",
+      (c) => hex(c.slice(10).toUpperCase()),
+      "hex",
+    ],
     ["spaced hex", (c) => (hex(c).match(PAIRS) ?? []).join(" "), "hex"],
     [
       "0x hex",
@@ -170,6 +222,13 @@ describe("findCanary", () => {
     expect(encoded.includes(span) || span.includes(encoded.slice(0, 8))).toBe(
       true
     );
+  });
+
+  it("reports whole characters for look-alikes outside the BMP", () => {
+    const styled = mathBold(canary);
+    const text = `Ref ${styled}.`;
+    const [finding] = findCanary(text, canary);
+    expect(text.slice(finding.start, finding.end)).toBe(styled);
   });
 
   it("finds base64 wrapped across lines", () => {

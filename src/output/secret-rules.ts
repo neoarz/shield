@@ -798,17 +798,26 @@ const BASE64_40 = /(?:^|[^A-Za-z0-9/+])([A-Za-z0-9/+]{40})(?![A-Za-z0-9/+=])/g;
 const HEX_32 = bounded("[a-f0-9]{32}", "A-Za-z0-9");
 const PATH_LIKE = /^[A-Za-z]{3,}(?:\/[A-Za-z]{3,}){2,}$/;
 
+/** Also paired with an access key ID that precedes it (see `detectSecrets`). */
+export const AWS_SECRET_ACCESS_KEY_RULE: ContextRule = {
+  kind: "aws_secret_access_key",
+  words: [
+    "aws",
+    "secretaccesskey",
+    "secret_access_key",
+    "secret-access-key",
+    "secret access key",
+  ],
+  pattern: BASE64_40,
+  severity: "critical",
+  confidence: 0.85,
+  minEntropy: 4,
+  minClasses: 3,
+  reject: (v) => PATH_LIKE.test(v),
+};
+
 export const CONTEXT_RULES: ContextRule[] = [
-  {
-    kind: "aws_secret_access_key",
-    words: ["aws", "secretaccesskey", "secret_access_key", "secret-access-key"],
-    pattern: BASE64_40,
-    severity: "critical",
-    confidence: 0.85,
-    minEntropy: 4,
-    minClasses: 3,
-    reject: (v) => PATH_LIKE.test(v),
-  },
+  AWS_SECRET_ACCESS_KEY_RULE,
   {
     kind: "twilio_api_key",
     words: ["twilio"],

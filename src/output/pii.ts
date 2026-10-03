@@ -474,7 +474,15 @@ const TEST_CARDS = new Set([
   "6200000000000005",
 ]);
 
-export function luhnValid(digits: string): boolean {
+const NUMBER_SEPARATORS = /[ -]/g;
+const CARD_DIGITS = /^\d{12,19}$/;
+
+/** Luhn check of a card number: 12 to 19 digits, ignoring spaces and dashes. */
+export function luhnValid(value: string): boolean {
+  const digits = value.replace(NUMBER_SEPARATORS, "");
+  if (!CARD_DIGITS.test(digits)) {
+    return false;
+  }
   let sum = 0;
   let double = false;
   for (let i = digits.length - 1; i >= 0; i--) {
@@ -488,7 +496,7 @@ export function luhnValid(digits: string): boolean {
     sum += d;
     double = !double;
   }
-  return digits.length > 0 && sum % 10 === 0;
+  return sum % 10 === 0;
 }
 
 function prefixBetween(
@@ -599,6 +607,9 @@ const SSN_SEPARATED = /^\d{3}([- ])\d{2}\1\d{4}$/;
 const SSN_PLAIN = /^\d{9}$/;
 const SSN_CONTEXT =
   /(?:^|[^a-z])(?:ssn|social security|social-security|taxpayer|itin|ss ?#)/;
+/** Labels for other numbers in the same NNN-NN-NNNN shape (order, part, and confirmation numbers). */
+const NOT_SSN_CONTEXT =
+  /(?:^|[^a-z])(?:order|confirmation|code|part|invoice|ticket|tracking|ref|reference|sku|serial|case|item|model|booking|reservation|account|acct|claim|policy)(?![a-z])|#/;
 const FAKE_SSNS = new Set(["078051120", "219099999", "123456789", "987654321"]);
 
 function ssnValid(digits: string): boolean {
@@ -620,8 +631,10 @@ function ssnVerdict(
 ): Verdict | null {
   const before = windowBefore(text, start, 40);
   const context = mentions(before, SSN_CONTEXT);
-  const phoneLike = mentions(before, PHONE_CONTEXT);
-  if (!(context || (hyphenated && !phoneLike))) {
+  const otherLabel =
+    mentions(before, PHONE_CONTEXT) ||
+    mentions(before.slice(-24), NOT_SSN_CONTEXT);
+  if (!(context || (hyphenated && !otherLabel))) {
     return null;
   }
   if (FAKE_SSNS.has(digits) || looksFakeDigits(digits)) {
@@ -730,7 +743,17 @@ const EXAMPLE_IBANS = new Set([
   "AT611904300234573201",
 ]);
 
-export function ibanChecksumValid(iban: string): boolean {
+const IBAN_SHAPE = /^[A-Z]{2}\d{2}[A-Z0-9]{11,30}$/;
+
+/**
+ * IBAN mod-97 check: a country code, two check digits, and 15 to 34
+ * characters in all. Spaces and dashes are ignored, and case does not matter.
+ */
+export function ibanChecksumValid(value: string): boolean {
+  const iban = value.replace(NUMBER_SEPARATORS, "").toUpperCase();
+  if (!IBAN_SHAPE.test(iban)) {
+    return false;
+  }
   const rearranged = iban.slice(4) + iban.slice(0, 4);
   let remainder = 0;
   for (let i = 0; i < rearranged.length; i++) {

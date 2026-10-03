@@ -1,4 +1,5 @@
 import {
+  AWS_SECRET_ACCESS_KEY_RULE,
   CONTEXT_RULES,
   type ContextRule,
   GATED_RULES,
@@ -15,6 +16,7 @@ import {
   decodeBase64Json,
   filterFindings,
   hasDigit,
+  longestRun,
   looksLikePlaceholder,
   previewSecret,
   type RankedFinding,
@@ -420,6 +422,62 @@ function runContextRules(scan: Scan): void {
   }
 }
 
+/**
+ * The kinds whose rules run. Pairing finds an unlabeled AWS secret by the
+ * access key ID before it, so key IDs are looked for whenever secrets are;
+ * the findings are filtered by `options` afterwards.
+ */
+function ruleFilter(options: SecretsOptions): KindFilter {
+  const filter: KindFilter = {
+    kinds: options.kinds ? new Set(options.kinds) : null,
+    exclude: options.exclude ? new Set(options.exclude) : null,
+  };
+  if (wants(filter, [AWS_SECRET_ACCESS_KEY_RULE.kind])) {
+    filter.kinds?.add("aws_access_key_id");
+    filter.exclude?.delete("aws_access_key_id");
+  }
+  return filter;
+}
+
+/** How far after an AWS access key ID its secret may start (console, CSV, and table layouts). */
+const AWS_PAIR_WINDOW = 100;
+
+/** A 40-character AWS secret shortly after an access key ID counts without a label. */
+function pairAwsSecrets(scan: Scan): void {
+  const rule = AWS_SECRET_ACCESS_KEY_RULE;
+  if (!wants(scan.filter, [rule.kind])) {
+    return;
+  }
+  const keyIds = scan.found.filter((f) => f.kind === "aws_access_key_id");
+  for (const keyId of keyIds) {
+    // Long enough to see the end of a value that starts at the window's edge.
+    const window = scan.text.slice(
+      keyId.end,
+      keyId.end + AWS_PAIR_WINDOW + 41
+    );
+    for (const match of window.matchAll(rule.pattern)) {
+      const value = match[1];
+      const offset = (match.index ?? 0) + match[0].length - value.length;
+      if (offset > AWS_PAIR_WINDOW) {
+        break;
+      }
+      if (contextValueOk(value, rule)) {
+        scan.found.push({
+          type: "secret",
+          kind: rule.kind,
+          start: keyId.end + offset,
+          end: keyId.end + offset + value.length,
+          severity: rule.severity,
+          confidence: rule.confidence,
+          preview: previewSecret(value, 0),
+          priority: PRIORITY_CONTEXT,
+        });
+        break;
+      }
+    }
+  }
+}
+
 // ---------------------------------------------------------------------------
 // Private key blocks
 // ---------------------------------------------------------------------------
@@ -693,16 +751,35 @@ const URL_AUTHORITY_STOP = asciiTable(" \t\r\n/?#\"'<>`\\");
 const SCHEME_CHAR = asciiTable(`${ALNUM_CHARS}+.-`);
 const HOST_PORT = /:\d+$/;
 
-function isPlaceholderPassword(password: string, user: string): boolean {
+const TEMPLATE_PASSWORD =
+  /^(?:\$\{[^}]*\}|\{\{[^}]*\}\}|<[^>]*>|\$[A-Z_][A-Z0-9_]*|%[A-Z_][A-Z0-9_]*%)$/;
+const PASSWORD_SEPARATORS = /[-_.\s]/g;
+const FILLER_AFFIXES = /^(?:your|my|the)|here$/g;
+
+/**
+ * True when the whole password is a stand-in: a default ("changeme",
+ * "your_password_here"), the user name, a template ("${DB_PASSWORD}",
+ * "<password>"), or a mask ("********"). Real passwords may contain "$",
+ * "{", or a marker word, so nothing here matches part of a password.
+ */
+function isExamplePassword(password: string, user: string): boolean {
   const lower = password.toLowerCase();
+  const bare = lower.replace(PASSWORD_SEPARATORS, "");
   return (
     password.length === 0 ||
     DEFAULT_PASSWORDS.has(lower) ||
+    DEFAULT_PASSWORDS.has(bare) ||
+    DEFAULT_PASSWORDS.has(bare.replace(FILLER_AFFIXES, "")) ||
     lower === user.toLowerCase() ||
     password.startsWith("[") ||
     password.startsWith(":") ||
-    looksLikePlaceholder(password)
+    TEMPLATE_PASSWORD.test(password) ||
+    longestRun(bare) === bare.length
   );
+}
+
+function isPlaceholderPassword(password: string, user: string): boolean {
+  return isExamplePassword(password, user) || looksLikePlaceholder(password);
 }
 
 function safeDecode(value: string): string {
@@ -788,7 +865,7 @@ function credentialVerdict(cred: UrlCredential): Verdict | null {
     if (!strong) {
       return null;
     }
-  } else if (isPlaceholderPassword(password, user)) {
+  } else if (isExamplePassword(password, user)) {
     return null;
   }
   const database = DATABASE_SCHEMES.has(cred.scheme);
@@ -1080,6 +1157,107 @@ function assignmentVerdict(
   };
 }
 
+const CONNECTION_PASSWORD_KEY = /^(?:password|pwd)$/i;
+const CONNECTION_STRING_KEY =
+  /(?:^|[;"'\s])(?:server|data source|user id|uid)[ \t]*=/i;
+/** How far around a connection-string password to look for its other keys. */
+const CONNECTION_WINDOW = 256;
+const MIN_CONNECTION_PASSWORD = 8;
+
+/**
+ * True when `Password=…` sits in a `;`-separated string that has a Server,
+ * Data Source, User ID, or UID key on the same line.
+ */
+function inConnectionString(
+  text: string,
+  keyStart: number,
+  valueEnd: number
+): boolean {
+  const before = text.slice(
+    Math.max(0, keyStart - CONNECTION_WINDOW),
+    keyStart
+  );
+  const after = text.slice(valueEnd, valueEnd + CONNECTION_WINDOW);
+  const lineBefore = before.slice(before.lastIndexOf("\n") + 1);
+  const newline = after.indexOf("\n");
+  const lineAfter = newline === -1 ? after : after.slice(0, newline);
+  const separated =
+    lineBefore.trimEnd().endsWith(";") || lineAfter.startsWith(";");
+  return (
+    separated &&
+    (CONNECTION_STRING_KEY.test(lineBefore) ||
+      CONNECTION_STRING_KEY.test(lineAfter))
+  );
+}
+
+/**
+ * Where a quoted connection-string value ends: at its closing quote, where
+ * a doubled quote stands for one quote in the value. -1 when it doesn't
+ * close on its line.
+ */
+function connectionValueEnd(text: string, from: number, quote: string): number {
+  const limit = Math.min(text.length, from + VALUE_MAX);
+  for (let i = from; i < limit; i++) {
+    const c = text.charAt(i);
+    if (c === "\n") {
+      return -1;
+    }
+    if (c === quote) {
+      if (text.charAt(i + 1) !== quote) {
+        return i;
+      }
+      i++;
+    }
+  }
+  return -1;
+}
+
+/**
+ * ADO.NET and ODBC connection strings often carry passwords shorter than
+ * the generic 16-character minimum; there 8 characters are enough. The
+ * password may be quoted.
+ */
+function readConnectionPassword(
+  text: string,
+  operator: number,
+  valueAt: number
+): RankedFinding | null {
+  const identifier = identifierBefore(text, operator);
+  if (!CONNECTION_PASSWORD_KEY.test(identifier)) {
+    return null;
+  }
+  const quote = isQuote(text.charAt(valueAt)) ? text.charAt(valueAt) : "";
+  const start = quote ? valueAt + 1 : valueAt;
+  const end = quote
+    ? connectionValueEnd(text, start, quote)
+    : unquotedValueEnd(text, start);
+  if (end === -1) {
+    return null;
+  }
+  const raw = text.slice(start, end);
+  const value = quote ? raw.split(quote + quote).join(quote) : raw;
+  const plausible =
+    value.length >= MIN_CONNECTION_PASSWORD &&
+    (hasDigit(value) || charClassCount(value) >= 3) &&
+    shannonEntropy(value) >= 2.5 &&
+    !isPlaceholderPassword(value, "");
+  const keyStart = operator - identifier.length;
+  const valueEnd = quote ? end + 1 : end;
+  if (!(plausible && inConnectionString(text, keyStart, valueEnd))) {
+    return null;
+  }
+  return {
+    type: "secret",
+    kind: "password_assignment",
+    start,
+    end,
+    severity: "high",
+    confidence: 0.6,
+    preview: `${identifier}=…`,
+    priority: PRIORITY_GENERIC,
+  };
+}
+
 function readAssignment(scan: Scan, operator: number): RankedFinding | null {
   const { text } = scan;
   if (continuesOperator(text, operator)) {
@@ -1095,7 +1273,9 @@ function readAssignment(scan: Scan, operator: number): RankedFinding | null {
   }
   const assigned = readAssignedValue(text, valueAt);
   if (!assigned) {
-    return null;
+    return length === 1 && text.charAt(operator) === "="
+      ? readConnectionPassword(text, operator, valueAt)
+      : null;
   }
   const identifier = identifierBefore(text, operator);
   if (!ASSIGNMENT_KEY.test(identifier)) {
@@ -1169,10 +1349,7 @@ export function detectSecrets(
   }
   const scan: Scan = {
     text,
-    filter: {
-      kinds: options.kinds ? new Set(options.kinds) : null,
-      exclude: options.exclude ? new Set(options.exclude) : null,
-    },
+    filter: ruleFilter(options),
     found: [],
     runs: [],
     unfiltered: !(options.kinds || options.exclude),
@@ -1180,6 +1357,7 @@ export function detectSecrets(
   lex(scan);
   runGatedRules(scan);
   runContextRules(scan);
+  pairAwsSecrets(scan);
   runStructuredScanners(scan);
   return filterFindings(stripPriority(resolveOverlaps(scan.found)), options);
 }

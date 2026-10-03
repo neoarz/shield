@@ -789,6 +789,39 @@ describe("credentials in URLs", () => {
       expect(detectSecrets(text), text).toEqual([]);
     }
   });
+
+  it("flags passwords with $, braces, encoded characters, or marker words", () => {
+    for (const password of [
+      `${rand(A62, 5)}${DOLLAR}${rand(A62, 7)}`,
+      `${rand(A62, 5)}%24${rand(A62, 7)}`,
+      `${rand(A62, 4)}{${rand(A62, 6)}`,
+      `${rand(A62, 4)}%3C${rand(A62, 6)}`,
+      `${rand(A62, 4)}Secret${rand(A62, 4)}`,
+      `${rand(A62, 4)}test${rand(A62, 6)}`,
+    ]) {
+      const text = `DATABASE_URL=postgres://app:${password}@db.prod.acme.io:5432/app`;
+      const finding = findKind(text, "database_connection_url");
+      expect(finding?.severity, password).toBe("critical");
+      expect(text.slice(finding?.start, finding?.end)).toBe(password);
+    }
+  });
+
+  it("skips passwords that are a placeholder as a whole", () => {
+    for (const password of [
+      `${DOLLAR}{DB_PASSWORD}`,
+      `${DOLLAR}DB_PASSWORD`,
+      "%3Cpassword%3E",
+      "{{db_password}}",
+      "%DB_PASSWORD%",
+      "your_password_here",
+      "YOUR-PASSWORD",
+      "********",
+      "changeme",
+    ]) {
+      const text = `postgres://app:${password}@db.prod.acme.io/app`;
+      expect(detectSecrets(text), text).toEqual([]);
+    }
+  });
 });
 
 describe("assignments", () => {
@@ -812,6 +845,44 @@ describe("assignments", () => {
       "auth_url = https://accounts.google.com/o/oauth2/auth",
     ];
     for (const text of benign) {
+      expect(detectSecrets(text), text).toEqual([]);
+    }
+  });
+
+  it("flags short passwords in connection strings", () => {
+    const password = rand(A62, 12);
+    for (const text of [
+      `Server=tcp:acme.database.windows.net,1433;Database=app;User ID=app;Password=${password};Encrypt=True;`,
+      `Data Source=sql01;Initial Catalog=app;User Id=svc;Pwd=${password}`,
+      `"Default": "Password=${password};Server=db01;Database=app;Uid=svc"`,
+      `Server=db01;User ID=svc;Password='${password}';Encrypt=True;`,
+      `Server=db01;User ID=svc;Password="${password}";Encrypt=True;`,
+    ]) {
+      const finding = findKind(text, "password_assignment");
+      expect(finding?.severity, text).toBe("high");
+      expect(text.slice(finding?.start, finding?.end)).toBe(password);
+    }
+  });
+
+  it("reads a doubled quote inside a quoted connection-string password as part of it", () => {
+    const [head, tail] = [rand(A62, 6), rand(A62, 6)];
+    for (const quote of ['"', "'"]) {
+      const value = `${head}${quote}${quote}${tail}`;
+      const text = `Server=db01;User ID=svc;Password=${quote}${value}${quote};Encrypt=True;`;
+      const finding = findKind(text, "password_assignment");
+      expect(text.slice(finding?.start, finding?.end), text).toBe(value);
+    }
+  });
+
+  it("keeps the 16-character minimum outside connection strings", () => {
+    const password = rand(A62, 12);
+    for (const text of [
+      `password=${password}`,
+      `Password=${password}; see the docs`,
+      `Server=db01;Database=app\nPassword=${password}`,
+      "Server=db01;Database=app;User ID=sa;Password=myPassword;",
+      "Server=db01;Database=app;User ID=sa;Password=YourPassw0rd;",
+    ]) {
       expect(detectSecrets(text), text).toEqual([]);
     }
   });
@@ -887,5 +958,51 @@ describe("offsets", () => {
     const starts = detectSecrets(text).map((f) => f.start);
     expect(starts).toEqual([...starts].sort((x, y) => x - y));
     expect(starts).toHaveLength(3);
+  });
+});
+
+describe("AWS credentials as the console and CLI show them", () => {
+  const keyId = `AKIA${rand(BASE32, 16)}`;
+  const secret = `${rand(A62, 18)}/${rand(A62, 12)}+${rand(A62, 8)}`;
+
+  it.each([
+    ["console labels", `Access key ID: ${keyId}\nSecret access key: ${secret}`],
+    [
+      "Title Case labels",
+      `Access Key ID: ${keyId}\nSecret Access Key: ${secret}`,
+    ],
+    [
+      "the credentials CSV",
+      `Access key ID,Secret access key\n${keyId},${secret}`,
+    ],
+    [
+      "a markdown table",
+      `| Access key ID | Secret access key |\n|---|---|\n| ${keyId} | ${secret} |`,
+    ],
+    ["the secret label alone", `Secret access key: ${secret}`],
+    ["a key ID and an unlabeled secret", `Key: ${keyId}\nSecret: ${secret}`],
+    ["a key ID and secret pair", `${keyId}:${secret}`],
+  ])("finds the secret access key in %s", (_, text) => {
+    const finding = findKind(text, "aws_secret_access_key");
+    expect(finding?.severity).toBe("critical");
+    expect(text.slice(finding?.start, finding?.end)).toBe(secret);
+  });
+
+  it("pairs the secret with its key ID when a filter leaves key IDs out", () => {
+    const text = `${keyId}:${secret}`;
+    for (const options of [
+      { kinds: ["aws_secret_access_key"] },
+      { exclude: ["aws_access_key_id"] },
+    ]) {
+      expect(
+        detectSecrets(text, options).map((f) => f.kind),
+        JSON.stringify(options)
+      ).toEqual(["aws_secret_access_key"]);
+    }
+  });
+
+  it("does not pair a key ID with a value that is not a secret", () => {
+    const text = `${keyId} was deployed at commit ${rand(HEX, 40)}`;
+    expect(findKind(text, "aws_secret_access_key")).toBeUndefined();
   });
 });

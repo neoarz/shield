@@ -37,6 +37,13 @@ function randomString(alphabet: string, length: number): string {
 
 const B64 = "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789+/";
 
+/** Lowercase letters in math bold, which canary matching folds to ASCII. */
+function mathBold(value: string): string {
+  return Array.from(value, (c) =>
+    String.fromCodePoint(0x1_d4_1a + c.charCodeAt(0) - 97)
+  ).join("");
+}
+
 /** Inputs shaped to trigger backtracking, quadratic rescans, or deep nesting. */
 const ADVERSARIAL: Record<string, string> = {
   "a*": fill("a"),
@@ -48,15 +55,21 @@ const ADVERSARIAL: Record<string, string> = {
   "[](*": fill("[]("),
   "<a x*": fill("<a x"),
   "<img src=*": fill("<img src="),
+  "<iframe srcdoc=*": fill('<iframe srcdoc="&lt;iframe srcdoc=&quot;<img src=//e.example/'),
+  "css escapes": fill("url(\\74\\t//"),
+  "css escapes ended by a space": fill("url(h\\74 tps://e/"),
   '<a href="…?d=*': fill('<a href="https://e.example/?d='),
   digits: fill("1"),
   "spaced digits": fill("1 "),
   "hyphenated digits": fill("1-"),
+  "labeled SSN-shaped numbers": fill("Order 482-19-3375 "),
   "+1 *": fill("+1 "),
   "private key headers": fill("-----BEGIN PRIVATE KEY-----\n"),
   "jwt-ish": fill("eyJaaaaaaaaaa.eyJaaaaaaaaaa."),
   "password=*": fill("password="),
   "password:*": fill("password:"),
+  "connection strings": fill("Server=a;Password=Ab3dEf6h9;"),
+  "Pwd=…;*": fill("Pwd=Ab3dEf6h9;"),
   'password="*': fill('password="'),
   "token: *": fill("token: "),
   "Authorization: Bearer *": fill("Authorization: Bearer "),
@@ -64,16 +77,33 @@ const ADVERSARIAL: Record<string, string> = {
   "http://a:*": fill("http://a:"),
   "://@*": fill("://@"),
   backticks: fill("`"),
+  "escaped backticks": fill("\\`//"),
+  "backticks across paragraphs": fill("`//\n\n"),
+  "backtick runs of growing length": Array.from(
+    { length: 1400 },
+    (_, i) => `${"`".repeat(i + 1)}//`
+  ).join(""),
   fences: fill("```\n"),
   "%41*": fill("%41"),
   "url(*": fill("url("),
+  "&#116;*": fill("&#116;"),
+  "http:*": fill("http:"),
+  "escaped destinations": fill("![x](h&#116;tps\\:"),
   "reference definitions": fill("\n[x]: "),
   "open quotes": fill('[a](b "'),
   hex: fill("0123456789abcdef"),
+  "math bold canary prefix": fill(`${mathBold("zlcanary")} `),
+  "circled letters": fill("ⓩⓛⓒⓐ "),
+  "circled letters of a canary prefix": fill("ⓩⓛⓒ"),
+  "full-width hex of a canary prefix": fill("５ａ４ｃ２ｄ"),
   "0x*": fill("0x5a, "),
   "a.*": fill("a."),
   "aws *": fill("aws "),
   "AKIA*": fill("AKIA"),
+  "secret access key *": fill("secret access key "),
+  "AWS key ID and secret pairs": fill(
+    `AKIA${randomString("ABCDEFGHIJKLMNOPQRSTUVWXYZ234567", 16)} ${randomString(B64, 40)} `
+  ),
   "nested brackets": `${"[".repeat(MB / 2)}${"]".repeat(MB / 2)}`,
   "long line then newline": `${fill("x", MB - 1)}\n`,
 };
@@ -133,6 +163,17 @@ function slowCases(
 }
 
 describe("adversarial inputs", () => {
+  it("never reads a look-alike letter as a separator between canary letters", () => {
+    // When one could be both, 360 circled letters took 2.5s, doubling with
+    // every 30 more.
+    expect(timeMs(() => findCanary("ⓩⓛⓒ".repeat(120), CANARY))).toBeLessThan(
+      100
+    );
+    expect(
+      timeMs(() => findCanary("５ａ４ｃ２ｄ".repeat(120), CANARY))
+    ).toBeLessThan(100);
+  });
+
   // Catastrophic backtracking on 1MB takes seconds to minutes; these budgets
   // are several times what an idle machine needs, so a loaded CI runner or
   // parallel test workers don't fail them, and a real regression still does.

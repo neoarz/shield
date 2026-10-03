@@ -1,3 +1,4 @@
+import { ShieldError } from "../errors";
 import type { OutputFinding } from "./types";
 import { compareFindings, lastItem } from "./util";
 
@@ -23,8 +24,8 @@ const CANARY_TOKEN = /^[A-Za-z0-9][A-Za-z0-9_-]*$/;
  * A random canary token such as `ZL-CANARY-7f3a9c2e41b0d6a8`: one word of
  * letters, digits, and hyphens, so models reproduce it verbatim. Uses
  * `globalThis.crypto.getRandomValues` (Node 19+, Bun, Deno, Workers,
- * browsers) and throws when Web Crypto is missing rather than falling back
- * to a weak source.
+ * browsers) and throws a `ShieldError` with code `CRYPTO_UNAVAILABLE` when
+ * Web Crypto is missing rather than falling back to a weak source.
  */
 export function createCanary(options: CanaryOptions = {}): string {
   const prefix = options.prefix ?? "zl";
@@ -37,8 +38,9 @@ export function createCanary(options: CanaryOptions = {}): string {
   }
   const webCrypto = (globalThis as { crypto?: Crypto }).crypto;
   if (typeof webCrypto?.getRandomValues !== "function") {
-    throw new Error(
-      "createCanary: globalThis.crypto.getRandomValues is not available. Use Node 19+ (or Node 18 with --experimental-global-webcrypto), Bun, Deno, Cloudflare Workers, or a browser."
+    throw new ShieldError(
+      "createCanary: globalThis.crypto.getRandomValues is not available. Use Node 19+ (or Node 18 with --experimental-global-webcrypto), Bun, Deno, Cloudflare Workers, or a browser.",
+      "CRYPTO_UNAVAILABLE"
     );
   }
   const random = new Uint8Array(bytes);
@@ -74,35 +76,56 @@ export function canaryInstruction(canary: string): string {
 
 /** Confusable Cyrillic and Greek letters, each followed by the ASCII letter it imitates. */
 const HOMOGLYPH_PAIRS = "аaеeоoсcрpхxуyіiԁdАaВbЕeСcОoРpХxαaοoΑaΒbΕeΟo";
-const HOMOGLYPHS = new Map<number, number>();
+/** Greek and Cyrillic, where the look-alike letters live. */
+const HOMOGLYPH_BLOCKS: [number, number][] = [
+  [0x03_91, 0x03_c9],
+  [0x04_00, 0x05_01],
+];
+/**
+ * Blocks whose letters and digits NFKC-fold to ASCII: superscripts and
+ * subscripts, modifier letters, letterlike symbols, number forms, circled
+ * letters and digits, full-width forms, and mathematical alphanumerics.
+ */
+const COMPATIBILITY_BLOCKS: [number, number][] = [
+  [0x00_aa, 0x00_ba],
+  [0x02_b0, 0x02_ff],
+  [0x1d_00, 0x1d_bf],
+  [0x20_70, 0x21_8f],
+  [0x24_60, 0x24_ff],
+  [0xff_00, 0xff_ef],
+  [0x1_d4_00, 0x1_d7_ff],
+  [0x1_f1_00, 0x1_f1_ff],
+];
+
+/** The lowercase ASCII letter or digit for an ASCII code, or -1. */
+function asciiAlnum(code: number): number {
+  if ((code >= 48 && code <= 57) || (code >= 97 && code <= 122)) {
+    return code;
+  }
+  return code >= 65 && code <= 90 ? code + 32 : -1;
+}
+
+/** Non-ASCII code points that read as an ASCII letter or digit, to its lowercase code. */
+const FOLDS = new Map<number, number>();
+for (const [from, to] of COMPATIBILITY_BLOCKS) {
+  for (let code = from; code <= to; code++) {
+    const folded = String.fromCodePoint(code).normalize("NFKC");
+    const ascii = folded.length === 1 ? asciiAlnum(folded.charCodeAt(0)) : -1;
+    if (ascii !== -1) {
+      FOLDS.set(code, ascii);
+    }
+  }
+}
 for (let i = 0; i < HOMOGLYPH_PAIRS.length; i += 2) {
-  HOMOGLYPHS.set(
+  FOLDS.set(
     HOMOGLYPH_PAIRS.charCodeAt(i),
     HOMOGLYPH_PAIRS.charCodeAt(i + 1)
   );
 }
 
-/** Maps a UTF-16 code unit to a lowercase ASCII letter or digit, or -1 to drop it. */
-function foldChar(code: number): number {
-  if ((code >= 48 && code <= 57) || (code >= 97 && code <= 122)) {
-    return code;
-  }
-  if (code >= 65 && code <= 90) {
-    return code + 32;
-  }
-  if (code < 128) {
-    return -1;
-  }
-  if (code >= 0xff_10 && code <= 0xff_19) {
-    return code - 0xff_10 + 48;
-  }
-  if (code >= 0xff_21 && code <= 0xff_3a) {
-    return code - 0xff_21 + 97;
-  }
-  if (code >= 0xff_41 && code <= 0xff_5a) {
-    return code - 0xff_41 + 97;
-  }
-  return HOMOGLYPHS.get(code) ?? -1;
+/** Maps a code point to a lowercase ASCII letter or digit, or -1 to drop it. */
+function foldCodePoint(code: number): number {
+  return code < 128 ? asciiAlnum(code) : (FOLDS.get(code) ?? -1);
 }
 
 function isHexDigit(code: number): boolean {
@@ -125,9 +148,17 @@ interface View {
 
 type Keep = (text: string, i: number) => number;
 
-/** Returns 1 to keep text[i], 0 to drop it, 2 to drop it and the next character. */
+/**
+ * Returns 1 to keep text[i], 0 to drop it, 2 to drop it and the next
+ * character, 3 to keep it together with the next (a surrogate pair).
+ */
 function keepAlnum(text: string, i: number): number {
-  return foldChar(text.charCodeAt(i)) === -1 ? 0 : 1;
+  const code = text.codePointAt(i) ?? 0;
+  const kept = foldCodePoint(code) !== -1;
+  if (code > 0xff_ff) {
+    return kept ? 3 : 2;
+  }
+  return kept ? 1 : 0;
 }
 
 function keepHex(text: string, i: number): number {
@@ -147,11 +178,11 @@ function lazyView(text: string, chars: string, keep: Keep): View {
     let i = 0;
     while (i < text.length && size < chars.length) {
       const verdict = keep(text, i);
-      if (verdict === 1) {
+      if (verdict === 1 || verdict === 3) {
         out[size] = i;
         size++;
       }
-      i += verdict === 2 ? 2 : 1;
+      i += verdict >= 2 ? 2 : 1;
     }
     out[size] = text.length;
     return out;
@@ -165,17 +196,26 @@ function lazyView(text: string, chars: string, keep: Keep): View {
   };
 }
 
-const NOT_ALNUM_CANDIDATE = /[^A-Za-z0-9Α-ωЀ-ԁ０-ｚ]+/g;
+const FOLDABLE_RANGES = [...HOMOGLYPH_BLOCKS, ...COMPATIBILITY_BLOCKS]
+  .map(([from, to]) => `\\u{${from.toString(16)}}-\\u{${to.toString(16)}}`)
+  .join("");
+const NOT_ALNUM_CANDIDATE = new RegExp(
+  `[^A-Za-z0-9${FOLDABLE_RANGES}]+`,
+  "gu"
+);
 const NON_ASCII = /[\u0080-￿]/;
-const NON_ASCII_GLOBAL = /[\u0080-￿]/g;
+const NON_ASCII_GLOBAL = /[\u0080-\u{10ffff}]/gu;
 const NOT_HEX = /0[xX]|[^0-9A-Fa-f]+/g;
 
 function foldString(char: string): string {
-  const folded = foldChar(char.charCodeAt(0));
+  const folded = foldCodePoint(char.codePointAt(0) ?? 0);
   return folded === -1 ? "" : String.fromCharCode(folded);
 }
 
-/** Letters and digits only, lowercased, full-width and look-alike letters folded to ASCII. */
+/**
+ * Letters and digits only, lowercased, with full-width, circled, math, and
+ * other compatibility forms (NFKC) and look-alike letters folded to ASCII.
+ */
 function alnumView(text: string): View {
   let chars = text.replace(NOT_ALNUM_CANDIDATE, "");
   if (NON_ASCII.test(chars)) {
@@ -267,19 +307,38 @@ function base64Cores(value: string): Base64Needle[] {
 const PROBE_LENGTH = 4;
 const REGEX_SPECIAL = /[\\^$.*+?()[\]{}|-]/g;
 
-/** Every character that folds to `code` (ASCII case, full-width, look-alikes), as a class. */
+/** `codes` (sorted) as character class ranges, such as `\u{2460}-\u{2473}`. */
+function classRanges(codes: number[]): string {
+  const ranges: string[] = [];
+  for (let i = 0; i < codes.length; i++) {
+    const from = codes[i];
+    while (i + 1 < codes.length && codes[i + 1] === codes[i] + 1) {
+      i++;
+    }
+    const to = codes[i];
+    const start = `\\u{${from.toString(16)}}`;
+    ranges.push(from === to ? start : `${start}-\\u{${to.toString(16)}}`);
+  }
+  return ranges.join("");
+}
+
+/**
+ * Any run of characters that don't fold to a letter or digit. A probe
+ * letter can never also be read as a separator, so each run is scanned once.
+ */
+const SEPARATORS = `[^A-Za-z0-9${classRanges(
+  [...FOLDS.keys()].sort((a, b) => a - b)
+)}]*`;
+
+/** Every character that folds to `code` (ASCII case, compatibility forms, look-alikes), as a class. */
 function variantsOf(code: number): string {
   const variants = new Set([String.fromCharCode(code)]);
   if (code >= 97 && code <= 122) {
     variants.add(String.fromCharCode(code - 32));
-    variants.add(String.fromCharCode(code - 97 + 0xff_41));
-    variants.add(String.fromCharCode(code - 97 + 0xff_21));
-  } else if (code >= 48 && code <= 57) {
-    variants.add(String.fromCharCode(code - 48 + 0xff_10));
   }
-  for (const [from, to] of HOMOGLYPHS) {
+  for (const [from, to] of FOLDS) {
     if (to === code) {
-      variants.add(String.fromCharCode(from));
+      variants.add(String.fromCodePoint(from));
     }
   }
   const members = Array.from(variants)
@@ -289,17 +348,16 @@ function variantsOf(code: number): string {
 }
 
 /**
- * Matches the first few characters of any alnum needle with separators
- * between them. Separators are unbounded but cannot contain letters or
- * digits, so each run is scanned once.
+ * Matches the first few characters of any alnum needle, each written as
+ * any of its variants, with separators between them.
  */
 function alnumProbe(values: string[]): RegExp {
   const alternatives = values.map((value) =>
     Array.from(value.slice(0, PROBE_LENGTH), (c) =>
       variantsOf(c.charCodeAt(0))
-    ).join("[^A-Za-z0-9]*")
+    ).join(SEPARATORS)
   );
-  return new RegExp(alternatives.join("|"));
+  return new RegExp(alternatives.join("|"), "u");
 }
 
 /** Matches the first characters of each target, each written plainly or as a %XX escape. */
@@ -317,21 +375,33 @@ function percentProbe(values: string[]): RegExp {
       return `(?:[${plain.join("")}]|${escapes.join("|")})`;
     }).join("")
   );
-  return new RegExp(alternatives.join("|"));
+  return new RegExp(alternatives.join("|"), "u");
 }
 
-/** Matches the first bytes of any hex needle, allowing separators and 0x / \\x / % escapes between bytes. */
+/** `[aA]` for a letter, the digit itself otherwise. */
+function asciiCaseless(code: number): string {
+  const char = String.fromCharCode(code);
+  const upper = char.toUpperCase();
+  return upper === char ? char : `[${char}${upper}]`;
+}
+
+/**
+ * Matches the first bytes of any hex needle, allowing separators and
+ * 0x / \\x / % escapes between bytes. Only ASCII hex digits count, as in
+ * the hex view, so a digit is never also a separator.
+ */
 function hexProbe(values: string[]): RegExp {
   const alternatives = values.map((value) => {
     const bytes: string[] = [];
     for (let i = 0; i + 1 < Math.min(value.length, PROBE_LENGTH * 2); i += 2) {
       bytes.push(
-        variantsOf(value.charCodeAt(i)) + variantsOf(value.charCodeAt(i + 1))
+        asciiCaseless(value.charCodeAt(i)) +
+          asciiCaseless(value.charCodeAt(i + 1))
       );
     }
     return bytes.join("(?:[^0-9A-Fa-f]|0[xX])*");
   });
-  return new RegExp(alternatives.join("|"));
+  return new RegExp(alternatives.join("|"), "u");
 }
 
 function buildNeedles(canary: string): CanaryNeedles {
@@ -350,10 +420,10 @@ function buildNeedles(canary: string): CanaryNeedles {
     { value: core, kind: "obfuscated", confidence: 0.95 },
     { value: reverse(core), kind: "reversed", confidence: 0.9 },
   ];
-  const hex: Needle[] = [
-    { value: toHex(canary), kind: "hex", confidence: 0.95 },
-    { value: toHex(lower), kind: "hex", confidence: 0.95 },
-  ];
+  const hex: Needle[] = Array.from(
+    new Set([canary, lower, canary.toUpperCase()]),
+    (target) => ({ value: toHex(target), kind: "hex", confidence: 0.95 })
+  );
   const base64Targets = new Set([canary, lower, canary.toUpperCase()]);
   if (random && random !== core) {
     alnum.push(
@@ -365,7 +435,9 @@ function buildNeedles(canary: string): CanaryNeedles {
       },
       { value: reverse(random), kind: "reversed", confidence: 0.85 }
     );
-    hex.push({ value: toHex(random), kind: "hex", confidence: 0.9 });
+    for (const target of new Set([random, random.toUpperCase()])) {
+      hex.push({ value: toHex(target), kind: "hex", confidence: 0.9 });
+    }
     base64Targets.add(random);
   }
   const visible = random
@@ -531,7 +603,8 @@ function addViewMatch(
 ): void {
   const length = needle.value.length;
   const first = view.offsetOf(index);
-  const end = view.offsetOf(index + length - 1) + 1;
+  const last = view.offsetOf(index + length - 1);
+  const end = last + ((text.codePointAt(last) ?? 0) > 0xff_ff ? 2 : 1);
   const start = needle.kind === "hex" ? hexStart(text, first) : first;
   // Separators between characters are fine; whole words in between are not.
   if (end - start > length * 8) {

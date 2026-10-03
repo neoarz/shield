@@ -385,6 +385,16 @@ const SENSITIVE_PARAMS = new Set([
   "email",
   "user",
 ]);
+/** Parameters that hold a search query: prose there is what the user searched for. */
+const SEARCH_PARAMS = new Set([
+  "q",
+  "query",
+  "k",
+  "keywords",
+  "search",
+  "search_query",
+  "term",
+]);
 const BASE64_BLOB = /^[A-Za-z0-9+/_-]{24,}={0,2}$/;
 const HEX_BLOB = /^[A-Fa-f0-9]{32,}$/;
 const TEMPLATE_MARKERS =
@@ -393,6 +403,7 @@ const WHITESPACE_RUN = /\s+/;
 const HEX_LABEL = /^[a-f0-9]{24,63}$/;
 const ALNUM_LABEL = /^[a-z0-9]{24,63}$/;
 const DIGIT = /\d/g;
+const ALL_DIGITS = /^\d+$/;
 const PRINTABLE = /[\x20-\x7e\t\n\r]/g;
 const FILE_EXTENSION = /\.[A-Za-z0-9]{1,5}$/;
 const PLUS = /\+/g;
@@ -463,8 +474,12 @@ function inspectValue(name: string, raw: string, signals: ValueSignals): void {
   }
   const words = wordCount(decoded);
   if (words >= 6 || (words >= 4 && decoded.length >= 40)) {
-    signals.reasons.add("prose");
-    signals.strong = true;
+    if (SEARCH_PARAMS.has(name)) {
+      signals.reasons.add("search_text");
+    } else {
+      signals.reasons.add("prose");
+      signals.strong = true;
+    }
   }
   if (isEncodedBlob(raw)) {
     signals.reasons.add("encoded_blob");
@@ -478,7 +493,9 @@ function inspectValue(name: string, raw: string, signals: ValueSignals): void {
     signals.reasons.add("long_value");
   }
   if (SENSITIVE_PARAMS.has(name) && decoded.length >= 8) {
-    signals.reasons.add("sensitive_param");
+    signals.reasons.add(
+      ALL_DIGITS.test(decoded) ? "numeric_param" : "sensitive_param"
+    );
   }
 }
 
@@ -665,8 +682,35 @@ export function insideAny(ranges: [number, number][], index: number): boolean {
 }
 
 /**
+ * Line starts that end a paragraph: a blank line, a fence, an ATX heading,
+ * a block quote, a list item, or a thematic break. A code span cannot
+ * cross one.
+ */
+const PARAGRAPH_BREAK =
+  /\n(?:[ \t\r]*\n|[ \t]{0,3}(?:#{1,6}[ \t\r\n]|>|[-+*][ \t]|\d{1,9}[.)][ \t]|```|~~~|\*\*\*|---|___))/g;
+
+function paragraphBreaks(text: string): number[] {
+  const breaks: number[] = [];
+  for (const match of text.matchAll(PARAGRAPH_BREAK)) {
+    breaks.push(match.index ?? 0);
+  }
+  return breaks;
+}
+
+/** True when an odd number of backslashes precede `index`. */
+function escapedAt(text: string, index: number): boolean {
+  let slashes = 0;
+  while (index - slashes > 0 && text.charCodeAt(index - slashes - 1) === 92) {
+    slashes++;
+  }
+  return slashes % 2 === 1;
+}
+
+/**
  * Inline code spans (CommonMark): a backtick run opens a span that the next
- * run of the same length closes; runs with no partner are literal.
+ * run of the same length in the same paragraph closes; runs with no partner
+ * are literal. A backslash escapes the first backtick of an opening run,
+ * but not a closing one (backslashes are literal inside a span).
  */
 function codeSpans(
   text: string,
@@ -674,32 +718,51 @@ function codeSpans(
 ): [number, number][] {
   const starts: number[] = [];
   const lengths: number[] = [];
+  /** Run indices by run length, and how far each list has been consumed. */
+  const byLength = new Map<number, number[]>();
+  const cursors = new Map<number, number>();
   let at = text.indexOf("`");
   while (at !== -1) {
     const length = runLength(text, at, "`");
     if (!insideAny(fences, at)) {
+      const runs = byLength.get(length) ?? [];
+      runs.push(starts.length);
+      byLength.set(length, runs);
       starts.push(at);
       lengths.push(length);
     }
     at = text.indexOf("`", at + length);
   }
-  // nextSame[i]: the next run with the same length as run i, or -1.
-  const nextSame: number[] = new Array(starts.length);
-  const lastSeen: number[] = [];
-  for (let i = starts.length - 1; i >= 0; i--) {
-    const length = lengths[i];
-    nextSame[i] = lastSeen[length] ?? -1;
-    lastSeen[length] = i;
-  }
+  const nextRun = (length: number, after: number): number => {
+    const runs = byLength.get(length);
+    if (!runs) {
+      return -1;
+    }
+    let cursor = cursors.get(length) ?? 0;
+    while (cursor < runs.length && runs[cursor] <= after) {
+      cursor++;
+    }
+    cursors.set(length, cursor);
+    return cursor < runs.length ? runs[cursor] : -1;
+  };
+  const breaks = paragraphBreaks(text);
   const spans: [number, number][] = [];
+  let b = 0;
   let i = 0;
   while (i < starts.length) {
-    const close = nextSame[i];
-    if (close === -1) {
-      i++;
-    } else {
-      spans.push([starts[i], starts[close] + lengths[close]]);
+    const escaped = escapedAt(text, starts[i]);
+    const open = escaped ? starts[i] + 1 : starts[i];
+    const length = escaped ? lengths[i] - 1 : lengths[i];
+    while (b < breaks.length && breaks[b] < open) {
+      b++;
+    }
+    const limit = b < breaks.length ? breaks[b] : text.length;
+    const close = length > 0 ? nextRun(length, i) : -1;
+    if (close !== -1 && starts[close] < limit) {
+      spans.push([open, starts[close] + length]);
       i = close + 1;
+    } else {
+      i++;
     }
   }
   return spans;
@@ -754,6 +817,8 @@ interface Scan {
   consumed: [number, number][];
   /** The text has "]:" so reference definitions may exist. */
   hasDefinitions: boolean;
+  /** How many iframe srcdoc documents this scan is nested in. */
+  depth: number;
   out: RankedFinding[];
 }
 
@@ -850,6 +915,24 @@ function autoLoadVerdict(
   return { severity: "high", confidence: category === "resource" ? 0.75 : 0.8 };
 }
 
+/**
+ * Weak reasons that ordinary links have too (a search query, the opaque id
+ * of a share link, a numeric id): they count for resources that load on
+ * their own, but do not make a link suspicious.
+ */
+const ORDINARY_LINK_REASONS = new Set([
+  "search_text",
+  "path_blob",
+  "numeric_param",
+]);
+
+function linkCarriesData(evidence: Evidence): boolean {
+  return (
+    evidence.strong ||
+    evidence.reasons.some((reason) => !ORDINARY_LINK_REASONS.has(reason))
+  );
+}
+
 function linkVerdict(
   scan: Scan,
   candidate: Candidate,
@@ -858,7 +941,7 @@ function linkVerdict(
   if (scan.flagLinks === "none") {
     return null;
   }
-  if (evidence) {
+  if (evidence && linkCarriesData(evidence)) {
     return evidence.strong
       ? { severity: "high", confidence: 0.85 }
       : { severity: "medium", confidence: 0.7 };
@@ -1080,6 +1163,35 @@ function referenceLabel(
   return normalizeLabel(label || linkText);
 }
 
+const BACKSLASH_ESCAPE = /\\([!-/:-@[-`{-~])/g;
+
+/**
+ * Targets for `decoded`, what a decoding renderer loads, and for `raw`, what
+ * one that leaves the URL as written loads. Both count when they differ:
+ * "https://evil.example\@acme.dev" is acme.dev decoded but evil.example raw.
+ */
+function resolveForms(decoded: string, raw: string): Target[] {
+  const targets: Target[] = [];
+  for (const value of decoded === raw ? [raw] : [decoded, raw]) {
+    const target = resolveTarget(value);
+    if (target) {
+      targets.push(target);
+    }
+  }
+  return targets;
+}
+
+/**
+ * Resolves a markdown destination with backslash escapes and entity
+ * references decoded, as CommonMark renderers do, and as written.
+ */
+function resolveDestination(raw: string): Target[] {
+  const unescaped = raw.includes("\\")
+    ? raw.replace(BACKSLASH_ESCAPE, "$1")
+    : raw;
+  return resolveForms(decodeEntities(unescaped), raw);
+}
+
 function reportInlineLink(
   scan: Scan,
   open: number,
@@ -1089,20 +1201,20 @@ function reportInlineLink(
 ): void {
   const { text } = scan;
   const destination = inlineDestination(text, after);
-  const target = destination
-    ? resolveTarget(text.slice(destination.start, destination.end))
-    : null;
-  if (!(destination && target)) {
+  if (!destination) {
     return;
   }
-  report(scan, {
-    kind: image ? "markdown_image" : "markdown_link",
-    category: image ? "image" : "link",
-    start: image ? open - 1 : open,
-    end: Math.max(destination.close, destination.end),
-    target,
-    label: linkText,
-  });
+  const raw = text.slice(destination.start, destination.end);
+  for (const target of resolveDestination(raw)) {
+    report(scan, {
+      kind: image ? "markdown_image" : "markdown_link",
+      category: image ? "image" : "link",
+      start: image ? open - 1 : open,
+      end: Math.max(destination.close, destination.end),
+      target,
+      label: linkText,
+    });
+  }
 }
 
 function scanMarkdownInline(scan: Scan, uses: ReferenceUse[]): void {
@@ -1138,19 +1250,20 @@ function scanReferenceDefinitions(scan: Scan, uses: ReferenceUse[]): void {
     const urlStart = index + match[0].length - raw.length;
     scan.consumed.push([index, index + match[0].length]);
     const use = usage.get(normalizeLabel(match[1]));
-    const destination = raw.startsWith("<") ? raw.slice(1, -1) : raw;
-    const target = use ? resolveTarget(destination) : null;
-    if (!(use && target)) {
+    if (!use) {
       continue;
     }
-    report(scan, {
-      kind: use.image ? "markdown_image" : "markdown_link",
-      category: use.image ? "image" : "link",
-      start: urlStart,
-      end: urlStart + raw.length,
-      target,
-      label: use.text,
-    });
+    const destination = raw.startsWith("<") ? raw.slice(1, -1) : raw;
+    for (const target of resolveDestination(destination)) {
+      report(scan, {
+        kind: use.image ? "markdown_image" : "markdown_link",
+        category: use.image ? "image" : "link",
+        start: urlStart,
+        end: urlStart + raw.length,
+        target,
+        label: use.text,
+      });
+    }
   }
 }
 
@@ -1219,6 +1332,16 @@ const LINK_ATTRIBUTES: Record<string, string[]> = {
   input: ["formaction"],
 };
 
+/**
+ * A character reference or CSS escape as browsers decode it: NUL,
+ * surrogates, and values past U+10FFFF become U+FFFD.
+ */
+function replacementCodePoint(code: number): string {
+  return code === 0 || (code >= 0xd8_00 && code <= 0xdf_ff) || code > 0x10_ff_ff
+    ? "\ufffd"
+    : String.fromCodePoint(code);
+}
+
 function decodeEntities(value: string): string {
   if (!value.includes("&")) {
     return value;
@@ -1232,10 +1355,9 @@ function decodeEntities(value: string): string {
       name: string | undefined
     ) => {
       if (dec || hex) {
-        const code = dec ? Number(dec) : Number.parseInt(hex ?? "", 16);
-        return code > 0 && code <= 0x10_ff_ff
-          ? String.fromCodePoint(code)
-          : whole;
+        return replacementCodePoint(
+          dec ? Number(dec) : Number.parseInt(hex ?? "", 16)
+        );
       }
       return NAMED_ENTITIES[(name ?? "").toLowerCase()] ?? whole;
     }
@@ -1427,6 +1549,10 @@ function analyzeTag(
       reportEventHandler(scan, start, end, attribute.name);
       continue;
     }
+    if (tag === "iframe" && attribute.name === "srcdoc") {
+      scanSrcdoc(scan, start, end, attribute.value);
+      continue;
+    }
     const category = tagCategory(tag, attribute.name);
     if (!category) {
       continue;
@@ -1449,32 +1575,112 @@ function analyzeTag(
 
 function scanHtml(scan: Scan): void {
   const { text } = scan;
-  TAG_OPEN.lastIndex = 0;
+  // A copy per call: an iframe srcdoc scans its document from inside the loop.
+  const tagOpen = new RegExp(TAG_OPEN);
   for (
-    let match = TAG_OPEN.exec(text);
+    let match = tagOpen.exec(text);
     match !== null;
-    match = TAG_OPEN.exec(text)
+    match = tagOpen.exec(text)
   ) {
     const parsed = parseTag(text, match.index + match[0].length);
-    TAG_OPEN.lastIndex = Math.max(parsed.end, match.index + 1);
+    tagOpen.lastIndex = Math.max(parsed.end, match.index + 1);
     analyzeTag(scan, match[1].toLowerCase(), match.index, parsed);
   }
-  TAG_OPEN.lastIndex = 0;
+}
+
+const MAX_SRCDOC_DEPTH = 2;
+
+/**
+ * An iframe's srcdoc is an HTML document that loads with the frame. Its
+ * findings are reported over the whole iframe tag, since their offsets
+ * are in the decoded attribute value. A srcdoc nested deeper than
+ * `MAX_SRCDOC_DEPTH` isn't scanned; nesting that deep only hides what it
+ * loads, so it is reported as a resource.
+ */
+function scanSrcdoc(
+  scan: Scan,
+  start: number,
+  end: number,
+  html: string
+): void {
+  if (!ANY_URLISH.test(html)) {
+    return;
+  }
+  if (scan.depth >= MAX_SRCDOC_DEPTH) {
+    const inCode = insideAny(scan.code, start);
+    scan.out.push({
+      type: "exfiltration",
+      kind: "html_resource",
+      start,
+      end,
+      severity: inCode ? "low" : "high",
+      confidence: inCode ? 0.2 : 0.7,
+      preview: "iframe srcdoc nested too deep to check",
+      priority: 2,
+    });
+    return;
+  }
+  const inner: Scan = {
+    ...scan,
+    text: html,
+    code: insideAny(scan.code, start) ? [[0, html.length]] : [],
+    consumed: [],
+    hasDefinitions: false,
+    depth: scan.depth + 1,
+    out: [],
+  };
+  if (html.includes("<")) {
+    scanHtml(inner);
+  }
+  if (hasCss(html)) {
+    scanCss(inner);
+  }
+  for (const finding of inner.out) {
+    scan.out.push({ ...finding, start, end });
+  }
 }
 
 // ---------------------------------------------------------------------------
 // CSS url() and @import
 // ---------------------------------------------------------------------------
 
-const CSS_URL = /url\(\s{0,16}(["']?)([^"'()\s]{1,8192})\1\s{0,16}\)/gi;
+// An escape such as `\74 ` takes the one space after it, so the URL may
+// contain it.
+const CSS_URL =
+  /url\(\s{0,16}(["']?)((?:\\[0-9a-fA-F]{1,6}[ \t\n]|[^"'()\s]){1,8192})\1\s{0,16}\)/gi;
 const CSS_IMPORT = /@import\s{1,16}(["'])([^"'\s]{1,8192})\1/gi;
+const CSS_ESCAPE = /\\(?:([0-9a-fA-F]{1,6})[ \t\n]?|([^\n0-9a-fA-F]))/g;
+
+function hasCss(text: string): boolean {
+  return (
+    text.includes("rl(") || text.includes("RL(") || text.includes("@import")
+  );
+}
+
+/** Decodes CSS escapes: `\74 ` and `\t` are both "t". */
+function cssUnescape(value: string): string {
+  if (!value.includes("\\")) {
+    return value;
+  }
+  return value.replace(
+    CSS_ESCAPE,
+    (whole, hex: string | undefined, char: string | undefined) => {
+      if (hex) {
+        return replacementCodePoint(Number.parseInt(hex, 16));
+      }
+      return char ?? whole;
+    }
+  );
+}
 
 function scanCss(scan: Scan): void {
   for (const pattern of [CSS_URL, CSS_IMPORT]) {
     for (const match of scan.text.matchAll(pattern)) {
-      const target = resolveTarget(match[2]);
+      // A style attribute is entity-decoded before CSS reads its escapes.
+      const raw = match[2];
+      const decoded = cssUnescape(decodeEntities(raw));
       const start = match.index ?? 0;
-      if (target) {
+      for (const target of resolveForms(decoded, raw)) {
         report(scan, {
           kind: "css_url",
           category: pattern === CSS_URL ? "image" : "resource",
@@ -1579,7 +1785,7 @@ function scanBareUrls(scan: Scan): void {
       ? null
       : dataEvidence(target);
     report(scan, {
-      kind: evidence ? "url_data" : "bare_url",
+      kind: evidence && linkCarriesData(evidence) ? "url_data" : "bare_url",
       category: "link",
       start,
       end: start + url.length,
@@ -1626,7 +1832,8 @@ function dedupe(findings: RankedFinding[]): OutputFinding[] {
   return stripPriority(kept);
 }
 
-const ANY_URLISH = /\/\/|\\\\|:[\\/]|javascript:|vbscript:|<[a-z]/i;
+const ANY_URLISH =
+  /\/\/|\\\\|:[\\/]|(?:https?|ftp|wss?|javascript|vbscript)\\?:|<[a-z]|&(?:#|[a-z]{2,8};)/i;
 
 /**
  * Finds content in model output that leaks data when it is rendered or
@@ -1656,6 +1863,7 @@ export function detectExfiltration(
     code: codeRanges(text),
     consumed: [],
     hasDefinitions: text.includes("]:"),
+    depth: 0,
     out: [],
   };
   const uses: ReferenceUse[] = [];
@@ -1668,9 +1876,7 @@ export function detectExfiltration(
   if (text.includes("<")) {
     scanHtml(scan);
   }
-  const css =
-    text.includes("rl(") || text.includes("RL(") || text.includes("@import");
-  if (css) {
+  if (hasCss(text)) {
     scanCss(scan);
   }
   if (text.includes("://")) {

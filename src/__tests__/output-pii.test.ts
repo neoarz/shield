@@ -47,6 +47,7 @@ function withLuhnDigit(body: string): string {
 }
 
 const GROUPS_OF_FOUR = /(.{4})/g;
+const SPACES = / /g;
 
 function group(number: string): string {
   return number.replace(GROUPS_OF_FOUR, "$1 ").trim();
@@ -236,6 +237,23 @@ describe("credit_card", () => {
     expect(luhnValid(visa)).toBe(true);
     expect(luhnValid("4242424242424241")).toBe(false);
   });
+
+  it("validates what the exported Luhn check is given", () => {
+    expect(luhnValid(group(visa))).toBe(true);
+    expect(luhnValid(group(visa).replace(SPACES, "-"))).toBe(true);
+    for (const bad of [
+      "0",
+      "00",
+      "",
+      "abc",
+      `${visa}\n`,
+      group(visa).replace(SPACES, "."),
+      withLuhnDigit("1234567890"),
+      withLuhnDigit("1234567890123456789"),
+    ]) {
+      expect(luhnValid(bad), JSON.stringify(bad)).toBe(false);
+    }
+  });
 });
 
 describe("us_ssn", () => {
@@ -255,6 +273,20 @@ describe("us_ssn", () => {
     expect(only("ssn=536221234", "us_ssn")).toHaveLength(1);
     expect(only("Values 536 22 1234", "us_ssn")).toEqual([]);
     expect(only("Batch 536221234", "us_ssn")).toEqual([]);
+  });
+
+  it("skips numbers labeled as something else", () => {
+    for (const text of [
+      "Order 482-19-3375 has shipped and should arrive Friday.",
+      "Your confirmation code is 512-44-8091.",
+      "Part 401-22-7781 replaces the old fan.",
+      "Ticket 536-22-1234 is closed.",
+    ]) {
+      expect(only(text, "us_ssn"), text).toEqual([]);
+    }
+    expect(
+      only("Order form, SSN 536-22-1234", "us_ssn")[0].confidence
+    ).toBe(0.95);
   });
 
   it("rejects impossible SSNs and marks well-known examples low", () => {
@@ -284,6 +316,14 @@ describe("iban", () => {
     expect(compact.preview.endsWith(german.slice(-4))).toBe(true);
     expect(compact.preview).not.toContain(german.slice(4, 12));
     expect(only(`IBAN ${group(french)}`, "iban")).toHaveLength(1);
+  });
+
+  it("validates what the exported IBAN check is given", () => {
+    expect(ibanChecksumValid(german.toLowerCase())).toBe(true);
+    expect(ibanChecksumValid(group(german))).toBe(true);
+    for (const bad of ["1", "0001", "", "XX", "DE89", `${german}!`]) {
+      expect(ibanChecksumValid(bad), bad).toBe(false);
+    }
   });
 
   it("rejects bad checksums and wrong lengths", () => {
