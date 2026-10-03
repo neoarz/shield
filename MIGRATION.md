@@ -50,6 +50,18 @@ The synchronous legacy helper `shieldMiddleware().wrapParams()` rejects asynchro
 
 MCP wrappers await hosted checks for tool definitions as well as tool results. For direct tool-definition checks use `await scanToolsAsync(tools, shield.options())`. Synchronous `scanTools()` rejects async detector options and keeps its local behavior otherwise.
 
+### Wrapper defaults changed since 1.2.1
+
+Upgrading from 1.x changes what the wrappers do even when you pass no new options:
+
+- **Tool results are scanned.** An injection in a tool or function result throws `InjectionDetectedError` with `source: "tool"`. Pass `scanToolResults: false` to turn this off; `detect: false` does not.
+- **Output is guarded.** Secrets and exfiltration links in responses and tool-call arguments are redacted. Pass `output: false` to turn this off, or `blockOnOutputFindings: true` to throw `OutputBlockedError` instead.
+- **Streams are read before they are returned.** In the default `"buffer"` mode the OpenAI, Groq, and Anthropic wrappers read the whole stream, then replay it. Use `streamingSanitize: "chunked"` for lower latency or `"passthrough"` to return the stream untouched.
+- **`allowPhrases` removes the phrases before scanning** instead of suppressing any detection in input that contains one.
+- **`onInjectionDetected`** receives the source (`"user"` or `"tool"`) as a second argument.
+- **`developer` messages are hardened** in the OpenAI and Groq wrappers, like `system` messages.
+- **Canary options are validated when the wrapper is created** and throw a `TypeError` or `RangeError` if a canary can't be matched in output.
+
 ## Local transformer models
 
 ```typescript
@@ -64,6 +76,6 @@ Root `detectAsync()` is retained for compatibility and still performs local dete
 
 ## Custom endpoints and long inputs
 
-`baseURL` includes the API version, such as `https://shield.example.invalid/v1`; `endpoint` specifies the complete moderation URL instead. Custom endpoints do not inherit the production API key. Pass a key explicitly if your endpoint needs one. HTTPS is required except for loopback HTTP during local development.
+`baseURL` includes the API version, such as `https://shield.example.invalid/v1`; `endpoint` specifies the complete moderation URL instead. Custom endpoints do not inherit the production API key. Pass a key explicitly if your endpoint needs one. HTTPS is required, except plain HTTP to `localhost`, `127.0.0.1`, or `[::1]` during local development.
 
 Inspect `result.shield.coverage` for a long document's window coverage. By default a partial scan returns its verdict with `truncated: true`. Set `requireFullCoverage: true` to reject partial scans or responses without coverage metadata. `signal` and `timeoutMs` control cancellation and request duration.

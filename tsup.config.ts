@@ -23,12 +23,11 @@ export default defineConfig({
   splitting: true,
   clean: true,
   outDir: "dist",
-  sourcemap: true,
+  // The maps would point at src/, which the package doesn't ship. If you
+  // turn them on, set esbuild's sourcesContent to false so the classifier
+  // weights stay out of them.
+  sourcemap: false,
   // ES2019 makes esbuild compile `??` and `?.` inline. With ES2020 they
   // survive to the CommonJS conversion, which turns them into closures.
   target: "es2019",
-  esbuildOptions(options) {
-    // Keeps the weights and other sources out of the source maps.
-    options.sourcesContent = false;
-  },
 });

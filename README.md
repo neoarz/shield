@@ -11,7 +11,7 @@ bun add @zeroleaks/shield
 # or: npm install @zeroleaks/shield
 ```
 
-The hosted client uses `fetch` and supports Node.js 18+, Bun, Deno, Cloudflare Workers, and browsers. Keep dashboard API keys in your server or Worker environment. Provider SDKs and local transformer inference are optional peer dependencies.
+The hosted client uses `fetch` and supports Node.js 18+, Bun, Deno, Cloudflare Workers, and browsers. Canaries need Web Crypto, which Node 18 provides only with `--experimental-global-webcrypto`; without it, `createCanary()` and `canary: true` throw a `ShieldError` with code `CRYPTO_UNAVAILABLE`. Keep dashboard API keys in your server or Worker environment. Provider SDKs and local transformer inference are optional peer dependencies.
 
 For optional local model inference, use a current security-patched Node.js 22 release (22.23.3 or later) or Bun 1.4.2 or later. The [local model installation guide](https://zeroleaks.ai/docs/shield-sdk/model#install) pins Transformers 3.8.1 and shows the consumer application override for Sharp 0.35.4, which includes fixes absent from Transformers' default Sharp 0.34.x dependency. The default SDK install does not include either package.
 
@@ -82,6 +82,8 @@ const model = wrapLanguageModel({
 const result = await generateText({ model, prompt: userInput });
 ```
 
+`shieldLanguageModelMiddleware()` needs `wrapLanguageModel`, which the `ai` package added in 4.2. On `ai` 3.x and 4.0–4.1, use the legacy `shieldMiddleware()` helper.
+
 Pass `detect: shield.options()` to the other wrappers in the same way. Omitting it preserves the wrappers' existing local detection behavior. The AI SDK middleware waits for detection before the model call. The legacy `shieldMiddleware()` helper provides `await wrapParamsAsync(params)` for hosted detection; its synchronous `wrapParams()` accepts only local synchronous checks.
 
 ## Request options
@@ -113,7 +115,7 @@ const shield = createHostedDetector({
 const result = await shield.detect(text, { signal: abortController.signal });
 ```
 
-Custom endpoints require HTTPS except for loopback HTTP. They do not inherit `ZEROLEAKS_API_KEY`; pass any self-hosted key explicitly. The package's `/server` module provides the private inference service; an OpenAI-compatible gateway must expose its results as `/v1/moderations` for this client.
+Custom endpoints require HTTPS, except plain HTTP to `localhost`, `127.0.0.1`, or `[::1]`. They do not inherit `ZEROLEAKS_API_KEY`; pass any self-hosted key explicitly. The package's `/server` module provides the private inference service; an OpenAI-compatible gateway must expose its results as `/v1/moderations` for this client.
 
 Use explicit local imports to keep detection in your process:
 
@@ -161,9 +163,9 @@ await client.connect(transport);
 const { tools } = await client.listTools(); // poisoned tools dropped
 ```
 
-The wrapper also pins each tool's definition and drops a tool whose definition later changes, refuses calls to flagged tools, and blocks tool calls whose arguments carry a credential or an exfiltration link. Without the wrapper, `await scanToolsAsync(tools, shield.options())` checks definitions with the hosted detector; `scanTools(tools)` performs local synchronous checks. Both accept MCP, OpenAI, Anthropic, or AI SDK tool definitions, and `pinTools()` pins them.
+The wrapper also pins each tool's definition and drops a tool whose definition later changes, refuses calls to flagged tools, and blocks tool calls whose arguments carry a credential or an exfiltration link. These checks apply however the SDK sends the call (`callTool()`, `request()`, or `experimental.tasks.callToolStream()`), and errors from tools, resources, and prompts are checked for injection like their results. Without the wrapper, `await scanToolsAsync(tools, shield.options())` checks definitions with the hosted detector; `scanTools(tools)` performs local synchronous checks. Both accept MCP, OpenAI, Anthropic, or AI SDK tool definitions, and `pinTools()` pins them.
 
-**Tool calls.** Detection misses some injections, so limit what the agent can do after it read content you can't trust. `createToolPolicy()` refuses undeclared tools, arguments that don't match the tool's schema, tools on a deny list, and calls past a limit; once the session has read untrusted content, it refuses tools that send data out unless the destination is allowed or you approve:
+**Tool calls.** Detection misses some injections, so limit what the agent can do after it read content you can't trust. `createToolPolicy()` refuses undeclared tools, arguments that don't match the tool's JSON Schema (`unevaluatedProperties`, `format`, and `contains` are not checked), tools on a deny list, and calls past a limit; once the session has read untrusted content, it refuses tools that send data out unless the destination is allowed or you approve:
 
 ```typescript
 import { createToolPolicy } from "@zeroleaks/shield";
@@ -193,17 +195,17 @@ const user = `Summarize this:\n${spotlight(emailBody, { label: "email" })}`;
 
 ## Provider wrappers
 
-Every wrapper hardens the system prompt, runs its configured detector on user messages and tool results, and runs `sanitize()` and `scanOutputText()` on the response, including tool-call arguments. Injections are blocked by default: the wrapper throws `InjectionDetectedError` before the request is sent.
+Every wrapper hardens the system prompt, runs its configured detector on user messages and tool results, and runs `sanitize()` and `scanOutputText()` on the response, including tool-call arguments. Injections are blocked by default: the wrapper throws `InjectionDetectedError` before the request is sent. LangChain's `ShieldCallbackHandler` and the OpenAI Agents SDK guardrails are the exceptions: they can stop a run but can't harden the prompt or redact output.
 
 | Provider | Import | Wraps |
 |---|---|---|
 | OpenAI | `shieldOpenAI` from `@zeroleaks/shield/openai` | `chat.completions.create`, `responses.create` |
 | Anthropic | `shieldAnthropic` from `@zeroleaks/shield/anthropic` | `messages.create` |
 | Groq | `shieldGroq` from `@zeroleaks/shield/groq` | `chat.completions.create` |
-| Vercel AI SDK 4, 5, 6 | `shieldLanguageModelMiddleware` from `@zeroleaks/shield/ai-sdk` | `generateText`, `streamText` via `wrapLanguageModel` |
+| Vercel AI SDK 4.2+, 5, 6 | `shieldLanguageModelMiddleware` from `@zeroleaks/shield/ai-sdk` | `generateText`, `streamText` via `wrapLanguageModel` |
 | Google Gen AI | `shieldGoogleGenAI` from `@zeroleaks/shield/google` | `models.generateContent`, `models.generateContentStream`, and chats |
 | Mistral | `shieldMistral` from `@zeroleaks/shield/mistral` | `chat.complete`, `chat.stream` |
-| LangChain.js | `shieldChatModel`, `ShieldCallbackHandler` from `@zeroleaks/shield/langchain` | `invoke`, `stream`, `batch`, and runnables derived from the model |
+| LangChain.js | `shieldChatModel`, `ShieldCallbackHandler` from `@zeroleaks/shield/langchain` | `invoke`, `stream`, `batch`, and runnables derived from the model (the callback handler stops a run; it can't harden or redact) |
 | MCP client | `shieldMcpClient` from `@zeroleaks/shield/mcp` | `listTools`, `callTool`, `readResource`, `getPrompt` (checks what the server returns; there is no model output) |
 | OpenAI Agents SDK | `shieldInputGuardrail`, `shieldOutputGuardrail`, `shieldToolInputGuardrail`, `shieldToolOutputGuardrail`, `shieldToolPolicyGuardrail` from `@zeroleaks/shield/openai-agents` | Agent input and output guardrails and function tool guardrails (they stop a run or a tool call; they can't redact) |
 
@@ -225,20 +227,22 @@ const client = shieldAnthropic(new Anthropic(), {
 | Option | Default | Description |
 |---|---|---|
 | `systemPrompt` | from the request | The prompt `sanitize()` compares output with |
-| `harden` | `{}` | `harden()` options, or `false` |
+| `harden` | `{}` | `harden()` options, or `false` (a `canary` is still planted, as one added line or text part) |
 | `detect` | Local checks | Pass `shield.options()` for hosted detection, local detection options, or `false` |
 | `scanToolResults` | Uses `detect` options | Separate detection options, or `false`. `detect: false` does not turn it off. |
 | `parallelDetection` | `false` | Run `escalate` at the same time as the model call instead of before it; the response is held until its verdict is in, and the call is still billed when it blocks. AI SDK middleware always waits before calling the model |
 | `onDetection` | `"block"` | `"block"` throws `InjectionDetectedError`; `"warn"` only calls `onInjectionDetected` |
+| `requireFullCoverage` | `false` | Treat a message or tool result longer than `maxInputLength` (1MB by default) as an injection with category `truncated`, since the rest of it is unchecked |
 | `sanitize` | `{}` | `sanitize()` options, or `false` |
 | `output` | secrets and exfiltration on | `scanOutputText()` options, or `false` |
 | `canary` | off | `true` creates a canary per wrapper; a string uses yours |
 | `throwOnLeak` | `false` | Throw `LeakDetectedError` instead of redacting a prompt leak or canary |
 | `blockOnOutputFindings` | `false` | Throw `OutputBlockedError` instead of redacting a high or critical output finding |
 | `streamingSanitize` | `"buffer"` | `"buffer"` reads the whole stream, then replays it with text redacted; `"chunked"` works in 8KB chunks for lower latency and memory; `"passthrough"` returns the stream untouched |
+| `streamingChunkSize` | `8192` | Characters per chunk in `"chunked"` mode |
 | `onInjectionDetected`, `onLeakDetected`, `onOutputFindings` | | Callbacks for logging and alerting |
 
-**Streaming.** In `"buffer"` mode the wrapper reads the whole stream before returning, then replays the provider's chunks with only redacted text rewritten, so tool calls, usage, and finish events are kept. `"chunked"` emits text as it goes, 8KB at a time, scans each chunk with the end of the previous one so a leak across a boundary is caught, and also replays the provider's other chunks and events. The OpenAI Responses API treats `"chunked"` as `"buffer"`.
+**Streaming.** In `"buffer"` mode the wrapper reads the whole stream before returning, then replays the provider's chunks with only redacted text rewritten, so tool calls, usage, and finish events are kept. `"chunked"` emits text as it goes, 8KB at a time, scans each chunk with the end of the previous one so a leak across a boundary is caught, and also replays the provider's other chunks and events. The OpenAI Responses API treats `"chunked"` as `"buffer"`, and its `"buffer"` mode holds each output item until the item is done rather than the whole response. In both modes, reasoning, thinking, and refusal deltas are passed through as they arrive; only answer text and tool-call arguments are held and checked. Mistral doesn't mark where one tool call's arguments end, so in `"chunked"` mode its wrapper holds events while a call is open.
 
 **Wrapped client type.** The OpenAI, Anthropic, and Groq wrappers return a proxy of your client, typed as your client, with only `create` replaced. Other methods, such as `chat.completions.parse()` or `messages.stream()`, still work but are not guarded, `withOptions()` returns a client that isn't wrapped, and `create()` returns a plain Promise without `withResponse()`.
 
@@ -261,7 +265,7 @@ const client = shieldAnthropic(new Anthropic(), {
 | `detectSecrets`, `detectPII`, `detectExfiltration` | Findings | [output](https://zeroleaks.ai/docs/shield-sdk/output) |
 | `createCanary`, `findCanary` | Token, findings | [output](https://zeroleaks.ai/docs/shield-sdk/output#canary-tokens) |
 
-The explicit local `detect()` options include `sensitivity` (`"strict"`, `"balanced"`, or `"permissive"`), `threshold` (lowest risk reported, default `"medium"`), `classifier` (`{ threshold, highThreshold }` or `false`), `denyPhrases` (always flagged), `allowPhrases` (removed from the input before scanning), `customPatterns`, and `includeCategories` or `excludeCategories`. See [Customizing detection](https://zeroleaks.ai/docs/shield-sdk/customize).
+The explicit local `detect()` options include `sensitivity` (`"strict"`, `"balanced"`, or `"permissive"`), `threshold` (lowest risk reported, default `"medium"`), `classifier` (`{ threshold, highThreshold }` or `false`), `denyPhrases` (always flagged), `allowPhrases` (removed from the input before scanning), `customPatterns`, `includeCategories` or `excludeCategories`, and `maxInputLength` (default 1MB; longer input is scanned up to that length and the result has `truncated: true`, so treat it as unchecked). The provider wrappers' local detection uses the same limit; pass `requireFullCoverage: true` to treat a longer message or tool result as an injection instead. `scanTools()` reports a longer definition with the issue `truncated`. See [Customizing detection](https://zeroleaks.ai/docs/shield-sdk/customize).
 
 ### Errors
 
@@ -274,6 +278,12 @@ All errors extend `ShieldError` and carry a `code`.
 | `LeakDetectedError` | `LEAK_DETECTED` | `confidence`, `fragmentCount` |
 | `OutputBlockedError` | `OUTPUT_BLOCKED` | `findings` (type, kind, and severity only, never the matched text) |
 | `ToolPolicyError` | `TOOL_POLICY_VIOLATION` | `tool`, `reason`, `violations` (paths and keywords, never argument values) |
+| `ShieldError` | `ASYNC_DETECTION_REQUIRES_AWAIT` | Thrown by synchronous `scanTools()` and `shieldMiddleware().wrapParams()` when given an async detector; use `scanToolsAsync()` or `wrapParamsAsync()` |
+| `ShieldError` | `CRYPTO_UNAVAILABLE` | Thrown by `createCanary()` and `canary: true` when Web Crypto is missing |
+| `ShieldError` | `LLM_DETECTOR_FAILED` | Thrown by `createLlmDetector()` with `onError: "throw"`. By default (`onError: "allow"`), a failed call counts as clean |
+| `ShieldError` | `MODEL_DEPENDENCY_MISSING`, `MODEL_LABEL_MISSING`, `MODEL_INVALID_OUTPUT`, `MODEL_DISPOSED` | Thrown by `createModelDetector()` |
+
+Invalid options, such as a canary that can't be matched in output, throw a `TypeError` or `RangeError` when the wrapper or helper is created.
 
 ## Threat model and limitations
 
@@ -283,7 +293,7 @@ It does not catch:
 
 - An agent misusing a permission it legitimately has. A polite request to refund the wrong account may contain nothing that looks like an injection.
 - Carefully written instructions that read like ordinary content. A detector can miss an attack even when its score is low.
-- Content it doesn't see: images, PDFs, audio, and text you send to the model without a wrapper or a `detect()` call.
+- Content it doesn't see: images, PDFs, audio, and text you send to the model without a wrapper or a `detect()` call. The wrappers check user messages and tool results, not earlier assistant turns or prefill, tool descriptions in the request, attached text files, or the output of tools the provider runs itself (code execution, file search, provider-side MCP connectors). Reasoning and refusal output isn't checked for leaks.
 - Leaks of the system prompt that are heavily reworded or translated, unless a canary is planted.
 
 Shield can flag benign text. Evaluate it on your own workflows before selecting a model and blocking policy. Local detection exposes thresholds and allow phrases; hosted detection uses the service's fixed classification threshold. With `parallelDetection: true`, integrations that support it may send text to a model before detection finishes; provider-hosted tools can execute during that call. Keep the default sequential detection when the verdict must precede those effects.

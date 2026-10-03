@@ -7,69 +7,174 @@
   "types": "dist/index.d.ts",
   "exports": {
     ".": {
-      "types": "./dist/index.d.ts",
-      "import": "./dist/index.mjs",
-      "require": "./dist/index.js"
+      "import": {
+        "types": "./dist/index.d.mts",
+        "default": "./dist/index.mjs"
+      },
+      "require": {
+        "types": "./dist/index.d.ts",
+        "default": "./dist/index.js"
+      }
     },
     "./openai": {
-      "types": "./dist/providers/openai.d.ts",
-      "import": "./dist/providers/openai.mjs",
-      "require": "./dist/providers/openai.js"
+      "import": {
+        "types": "./dist/providers/openai.d.mts",
+        "default": "./dist/providers/openai.mjs"
+      },
+      "require": {
+        "types": "./dist/providers/openai.d.ts",
+        "default": "./dist/providers/openai.js"
+      }
     },
     "./anthropic": {
-      "types": "./dist/providers/anthropic.d.ts",
-      "import": "./dist/providers/anthropic.mjs",
-      "require": "./dist/providers/anthropic.js"
+      "import": {
+        "types": "./dist/providers/anthropic.d.mts",
+        "default": "./dist/providers/anthropic.mjs"
+      },
+      "require": {
+        "types": "./dist/providers/anthropic.d.ts",
+        "default": "./dist/providers/anthropic.js"
+      }
     },
     "./ai-sdk": {
-      "types": "./dist/providers/ai-sdk.d.ts",
-      "import": "./dist/providers/ai-sdk.mjs",
-      "require": "./dist/providers/ai-sdk.js"
+      "import": {
+        "types": "./dist/providers/ai-sdk.d.mts",
+        "default": "./dist/providers/ai-sdk.mjs"
+      },
+      "require": {
+        "types": "./dist/providers/ai-sdk.d.ts",
+        "default": "./dist/providers/ai-sdk.js"
+      }
     },
     "./groq": {
-      "types": "./dist/providers/groq.d.ts",
-      "import": "./dist/providers/groq.mjs",
-      "require": "./dist/providers/groq.js"
+      "import": {
+        "types": "./dist/providers/groq.d.mts",
+        "default": "./dist/providers/groq.mjs"
+      },
+      "require": {
+        "types": "./dist/providers/groq.d.ts",
+        "default": "./dist/providers/groq.js"
+      }
     },
     "./google": {
-      "types": "./dist/providers/google.d.ts",
-      "import": "./dist/providers/google.mjs",
-      "require": "./dist/providers/google.js"
+      "import": {
+        "types": "./dist/providers/google.d.mts",
+        "default": "./dist/providers/google.mjs"
+      },
+      "require": {
+        "types": "./dist/providers/google.d.ts",
+        "default": "./dist/providers/google.js"
+      }
     },
     "./mistral": {
-      "types": "./dist/providers/mistral.d.ts",
-      "import": "./dist/providers/mistral.mjs",
-      "require": "./dist/providers/mistral.js"
+      "import": {
+        "types": "./dist/providers/mistral.d.mts",
+        "default": "./dist/providers/mistral.mjs"
+      },
+      "require": {
+        "types": "./dist/providers/mistral.d.ts",
+        "default": "./dist/providers/mistral.js"
+      }
     },
     "./langchain": {
-      "types": "./dist/providers/langchain.d.ts",
-      "import": "./dist/providers/langchain.mjs",
-      "require": "./dist/providers/langchain.js"
+      "import": {
+        "types": "./dist/providers/langchain.d.mts",
+        "default": "./dist/providers/langchain.mjs"
+      },
+      "require": {
+        "types": "./dist/providers/langchain.d.ts",
+        "default": "./dist/providers/langchain.js"
+      }
     },
     "./mcp": {
-      "types": "./dist/providers/mcp.d.ts",
-      "import": "./dist/providers/mcp.mjs",
-      "require": "./dist/providers/mcp.js"
+      "import": {
+        "types": "./dist/providers/mcp.d.mts",
+        "default": "./dist/providers/mcp.mjs"
+      },
+      "require": {
+        "types": "./dist/providers/mcp.d.ts",
+        "default": "./dist/providers/mcp.js"
+      }
     },
     "./openai-agents": {
-      "types": "./dist/providers/openai-agents.d.ts",
-      "import": "./dist/providers/openai-agents.mjs",
-      "require": "./dist/providers/openai-agents.js"
+      "import": {
+        "types": "./dist/providers/openai-agents.d.mts",
+        "default": "./dist/providers/openai-agents.mjs"
+      },
+      "require": {
+        "types": "./dist/providers/openai-agents.d.ts",
+        "default": "./dist/providers/openai-agents.js"
+      }
     },
     "./model": {
-      "types": "./dist/model.d.ts",
-      "import": "./dist/model.mjs",
-      "require": "./dist/model.js"
+      "import": {
+        "types": "./dist/model.d.mts",
+        "default": "./dist/model.mjs"
+      },
+      "require": {
+        "types": "./dist/model.d.ts",
+        "default": "./dist/model.js"
+      }
     },
     "./local": {
-      "types": "./dist/local.d.ts",
-      "import": "./dist/local.mjs",
-      "require": "./dist/local.js"
+      "import": {
+        "types": "./dist/local.d.mts",
+        "default": "./dist/local.mjs"
+      },
+      "require": {
+        "types": "./dist/local.d.ts",
+        "default": "./dist/local.js"
+      }
     },
     "./server": {
-      "types": "./dist/server.d.ts",
-      "import": "./dist/server.mjs",
-      "require": "./dist/server.js"
+      "import": {
+        "types": "./dist/server.d.mts",
+        "default": "./dist/server.mjs"
+      },
+      "require": {
+        "types": "./dist/server.d.ts",
+        "default": "./dist/server.js"
+      }
+    }
+  },
+  "typesVersions": {
+    "*": {
+      "openai": [
+        "./dist/providers/openai.d.ts"
+      ],
+      "anthropic": [
+        "./dist/providers/anthropic.d.ts"
+      ],
+      "ai-sdk": [
+        "./dist/providers/ai-sdk.d.ts"
+      ],
+      "groq": [
+        "./dist/providers/groq.d.ts"
+      ],
+      "google": [
+        "./dist/providers/google.d.ts"
+      ],
+      "mistral": [
+        "./dist/providers/mistral.d.ts"
+      ],
+      "langchain": [
+        "./dist/providers/langchain.d.ts"
+      ],
+      "mcp": [
+        "./dist/providers/mcp.d.ts"
+      ],
+      "openai-agents": [
+        "./dist/providers/openai-agents.d.ts"
+      ],
+      "model": [
+        "./dist/model.d.ts"
+      ],
+      "local": [
+        "./dist/local.d.ts"
+      ],
+      "server": [
+        "./dist/server.d.ts"
+      ]
     }
   },
   "files": [

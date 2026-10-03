@@ -1,25 +1,85 @@
 # Changelog
 
-## [2.0.0] - 2026-10-02
-
-- Root `detect()` now returns a Promise and calls the hosted Shield API with a dashboard key. `createHostedDetector()` supports the four hosted model IDs, self-hosted moderation endpoints, cancellation, timeouts, and provider wrapper options.
-- Synchronous rules and local classifier functions are available from `@zeroleaks/shield/local`; root `detectLocal` and the existing local `detectAsync` remain available. See [MIGRATION.md](MIGRATION.md).
-- AI SDK language model middleware now awaits async detection before model calls. The legacy synchronous `wrapParams()` rejects async detectors; `wrapParamsAsync()` supports them.
-- MCP tool-definition checks now await configured detectors. Direct callers can use `scanToolsAsync()`; synchronous `scanTools()` rejects async detector options.
-- Hosted failures reject with safe `ShieldAPIError` details. Coverage metadata is preserved, and `requireFullCoverage` can reject partial scans.
-
 All notable changes to this project will be documented in this file.
 
 The format is based on [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
-## Unpublished local development - 2026-09-27
+## [Unreleased]
 
-These entries describe historical local configurations. The archived evaluations informed subsequent development and have documented source overlap; they are not independent tests of the current hosted tiers.
+### Security
 
-Shield now protects agents, not just chat prompts: it scans tool results and documents for injection, checks model output for credentials, personal data, exfiltration links, and canary tokens, and detects injections with a built-in classifier instead of patterns alone. Defaults changed, so read "Changed" before upgrading.
+- **Private inference server:** an input holding an HTML reference to a surrogate code point, such as `&#xD800;`, no longer takes the instance offline. The tokenizer fails only that request, and HTML references to surrogates, NUL, or values past U+10FFFF decode to U+FFFD.
+- **`detect()` CPU cost:** the `curl` data-exfiltration rule and the "act as" rule run in linear time. 1MB of crafted text took up to 6 seconds of synchronous CPU, or 17 seconds inside hidden HTML, and the hosted server runs these rules. Long runs of out-of-order combining marks are cut before Unicode normalization, which reorders them in quadratic time; 1MB took 6.5 seconds.
+- **Exfiltration:** URLs hidden with character references (`h&#116;tps:`), backslash escapes, a scheme without slashes (`http:evil.com`), or CSS escapes (including `\74 ` with its space) are detected, as are images inside an `<iframe srcdoc>`. A srcdoc nested three or more levels deep is flagged instead of left unchecked. Escaped backticks no longer turn a live image into a low-severity "code" finding.
+- **MCP:**
+  - An injection in a tool, resource, or prompt error is blocked and taints the tool policy's session.
+  - Tool calls sent with `request()`, `requestStream()`, or `experimental.tasks.callToolStream()` get the same checks as `callTool()`.
+  - Call arguments and text blobs are scanned in full, not only their first 64KB.
+  - JSON-LD, YAML, and untyped text blobs, `resource_link` names, and structured-content keys are checked for injection.
+- **`scanTools()`** reads every string in a tool definition, at any depth, including `outputSchema`, annotations, `$comment`, `format`, and vendor keys.
+- **Provider wrappers** check every string and key of a JSON tool result, not only the strings in its first 64KB, so an instruction written as a key is caught.
+- **Text longer than detection reads** (`maxInputLength`, 1MB by default) can be refused: with the new `requireFullCoverage: true` wrapper option it counts as an injection with category `truncated`, blocked or reported with `onDetection: "warn"`, instead of passing with only its start checked. The default is unchanged. `scanTools()` reports such a definition with the issue `truncated`.
+- **Streamed tool arguments:** Google `partialArgs` and Mistral chunked tool-call deltas are checked whole, so a secret split across pieces is redacted. Each piece is matched to its own call, and in `"chunked"` mode Mistral events are held while a tool call is open, since another call's deltas can come between its pieces.
+- **Tool policy:** `additionalProperties: false` is enforced alongside `patternProperties`, and deeply nested schemas are refused instead of throwing `RangeError`. Violations show a key that only `patternProperties` matches as `*`, so a secret used as a key stays out of errors and logs.
+
+### Fixed
+
+- **`detect()`:**
+  - Injections padded past the window overlap with spaces or zero-width characters are found, and a single zero-width space between two words no longer hides one.
+  - ROT13, reversed, and upside-down injections are found even when the plain text uses the same words.
+  - Base64 and hex of Hindi, Thai, and Korean text, and hex written as a C array (`0x69, 0x67, …`), are decoded.
+  - `denyPhrases` with accented letters match in any case, and custom patterns using `\xHH` or `\uHHHH` escapes work.
+  - `sensitivity: "permissive"` reports classifier scores from its 0.75 threshold.
+  - `splitAcrossTurns` is `true` whenever only the joined turns found an injection.
+- **`sanitize()`:**
+  - Cuts out a plain leak instead of redacting the whole output when the output also contains URL escapes or HTML entities.
+  - Checks and returns output longer than 1MB instead of truncating it.
+  - Finds leaks written in small capitals or in base64 of non-Latin text.
+- **Secrets:**
+  - AWS secret access keys are found under the console's "Secret access key" label and next to an access key ID, even when `kinds` or `exclude` leaves key IDs out.
+  - Database URL passwords are found when they contain `$`, `{`, encoded characters, or words such as "test".
+  - Passwords of 8 or more characters, quoted or not, are found in ADO.NET, Azure SQL, and ODBC connection strings.
+- **Canary:** look-alike letters (math alphanumerics, circled letters) and upper-case hex forms are found, and `canary` works with `harden: false`.
+- **`luhnValid` and `ibanChecksumValid`** accept spaces, dashes, and lower case, and reject input that is too short or has other characters.
+- **Provider wrappers:**
+  - Mistral and LangChain check for leaks of every system message, not just the first.
+  - A leak split across several text blocks is caught (Anthropic, OpenAI Responses, AI SDK).
+  - Aborting a request rejects at once instead of waiting for detection.
+- **Tool policy** validates `prefixItems` (so zod 4 tuples are accepted), `propertyNames`, `uniqueItems`, `minProperties`, `maxProperties`, `multipleOf`, `dependentRequired`, `dependentSchemas`, `dependencies`, `additionalItems`, and `if`/`then`/`else`. Pins ignore key order at every depth.
+- **`createLlmDetector()`:**
+  - `timeoutMs` covers reading the reply and holds when `fetch` ignores the abort signal.
+  - Reasoning blocks such as `<think>…</think>` are ignored, and any `true` verdict in a reply is a detection.
+  - Replies whose content is an array of parts are read.
+  - An invalid `maxChars` or `timeoutMs` throws `RangeError`.
+  - Errors no longer include the transport's error text, which could quote the input.
+- **Hosted `detect()`:** `timeoutMs` and `signal` settle the call even when a custom `fetch`, or the body it returns, ignores the abort signal.
+- **Model scoring** always reads the end of a text, even after more than 64K characters of whitespace.
+- **Private server:**
+  - `createShieldServer` rejects a `maxBodyBytes`, `maxInputLength`, or `maxBatchSize` that isn't a positive integer.
+  - The `bearer` auth scheme is accepted in any letter case.
+  - The CLI checks every `SHIELD_*` setting before loading models, names any invalid variable, exits with status 1 on any startup failure, and refuses to start on Bun older than 1.4.2.
+- **Types** resolve for ESM projects using `moduleResolution: node16` or `nodenext`, and subpath types resolve under `node10`.
+
+### Changed
+
+- `detect()` results have `truncated: true` when the input was longer than `maxInputLength` (1MB by default) and only partly scanned. `detectAsync()` keeps the flag when a `secondaryDetector` or `escalate` result replaces the local one.
+- `createCanary()` throws a `ShieldError` with code `CRYPTO_UNAVAILABLE` when Web Crypto is missing (Node 18 without `--experimental-global-webcrypto`).
+- **Exfiltration:** everyday search links, share links with long IDs, and numeric IDs such as `?p=123` are no longer flagged. A plain link whose only evidence is prose in a search parameter isn't flagged by default; images, and secrets, email addresses, or base64 data in those parameters, still are.
+- **PII:** numbers shaped like an SSN but labeled as an order, part, confirmation, or similar number are no longer reported.
+- **`scanTools()`** issues gain `nested_too_deep` and `truncated`. Saved pins for definitions nested more than 16 levels deep report `changed_since_pinned` once.
+- **MCP:** every failed tool call is recorded with the tool policy, so an untrusted tool's error taints the session. `callToolStream()` and `requestStream()` throw while being read when a result is blocked.
+- The "act as" rule's pattern string in findings changed.
+- Source maps are no longer published, which makes the package about 600KB smaller unpacked.
+- CI loads the built package on Node 18, 20, 22, and 24.
+
+## [2.0.0] - 2026-10-02
+
+Shield now protects agents, not just chat prompts: it scans tool results and documents for injection, checks model output for credentials, personal data, exfiltration links, and canary tokens, and detects injections with a built-in classifier instead of patterns alone. Root `detect()` now calls the hosted Shield API. Defaults changed, so read "Changed" and [MIGRATION.md](MIGRATION.md) before upgrading.
 
 ### Added
+
+Benchmark figures below describe historical local configurations. The archived evaluations informed subsequent development and have documented source overlap; they are not independent tests of the current hosted tiers.
 
 - **Shield's model:** `@zeroleaks/shield/model` added a multilingual E5-small encoder (`zeroleaks/shield-small`) fine-tuned on about 530,000 labeled texts from public datasets. It reads input in 256-token windows every 192 tokens and reports the highest score. The archived run recorded mean balanced accuracy of 0.889 over five development groups and median latency of 25ms per call on one CPU thread. These figures apply to that artifact, configuration, and hardware. ProtectAI's model and other text-classification models also work through `model`.
 - **Shield's large model and `tiered()`:** `SHIELD_MODEL_LARGE` (`zeroleaks/shield-large`) added a Qwen3-1.7B classifier with 4-bit weights (about 1GB), reading 512-token windows every 384 tokens. `tiered(fast, large)` runs the default model on every input and the large model when its score is from 0.01 up to 0.97 (14% of inputs in the archived run). Historical large-model candidates recorded balanced accuracy of 0.818 on the group named `heldout_v4` and 0.751 on `heldout_v5`. These groups later informed development and do not establish performance on unseen data.
@@ -46,12 +106,17 @@ Shield now protects agents, not just chat prompts: it scans tool results and doc
 - **Parallel detection:** with `parallelDetection: true`, the provider wrappers run `escalate` detectors while the provider call is in flight and release the response, tool calls, and stream only after their verdict, so a slow model or LLM check adds the slower of the two times instead of their sum. The fast `detect()` still runs before the call.
 - **`detectAsync()` `escalate` option:** Sends input the classifier is unsure about (score at or above `minScore`, 0.15 by default) to a slower detector you provide, such as a transformer model, and keeps everything else on the fast path.
 - **`sanitize()` `decodePayloads` option.**
-- **`training/`:** The featurizer and training pipeline that build the classifier from public data.
-- **`benchmark/`:** The archived harness builds 13 benchmark sets and six sets named `heldout`, runs local Shield configurations and other detectors, and scores the results. An early local Shield 2.0 configuration recorded mean balanced accuracy of 0.734 on the latter group, compared with 0.631 for 1.2.1 and 0.895 for ProtectAI's DeBERTa v2 model in that run. Later development used these evaluations; the figures do not measure current hosted tiers.
+- **`training/`:** The featurizer and training pipeline that build the classifier from public data. It is not included in this repository or the npm package.
+- **`benchmark/`:** The archived harness (not included in this repository or the npm package) builds 13 benchmark sets and six sets named `heldout`, runs local Shield configurations and other detectors, and scores the results. An early local Shield 2.0 configuration recorded mean balanced accuracy of 0.734 on the latter group, compared with 0.631 for 1.2.1 and 0.895 for ProtectAI's DeBERTa v2 model in that run. Later development used these evaluations; the figures do not measure current hosted tiers.
 
 ### Changed
 
-- **`detect()` scans the whole input.** Before, only the first 8,192 characters were matched. Long inputs are scanned in overlapping 8KB windows.
+- Root `detect()` now returns a Promise and calls the hosted Shield API with a dashboard key. `createHostedDetector()` supports the four hosted model IDs, self-hosted moderation endpoints, cancellation, timeouts, and provider wrapper options.
+- Synchronous rules and local classifier functions are available from `@zeroleaks/shield/local`; root `detectLocal` and the existing local `detectAsync` remain available. See [MIGRATION.md](MIGRATION.md).
+- AI SDK language model middleware now awaits async detection before model calls. The legacy synchronous `wrapParams()` rejects async detectors; `wrapParamsAsync()` supports them.
+- MCP tool-definition checks now await configured detectors. Direct callers can use `scanToolsAsync()`; synchronous `scanTools()` rejects async detector options.
+- Hosted failures reject with safe `ShieldAPIError` details. Coverage metadata is preserved, and `requireFullCoverage` can reject partial scans.
+- **`detect()` scans the whole input, up to `maxInputLength` (1MB by default).** Before, only the first 8,192 characters were matched. Long inputs are scanned in overlapping 8KB windows.
 - **`detect()` reports every category found.** Before, matching stopped at the first critical match.
 - **`allowPhrases` removes the phrases before scanning** instead of suppressing any detection when the input contained one, which let an attacker bypass detection by including an allowed phrase.
 - **Normalization keeps digits and symbols** in the text patterns match, so patterns for addresses like `169.254.169.254`, `$(...)`, and `<!--` work again; leetspeak is decoded only inside words that mix letters and digits.
