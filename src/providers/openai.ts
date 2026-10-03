@@ -1,12 +1,15 @@
-import { type HardenOptions, harden } from "../harden";
+import { harden } from "../harden";
 import {
   callProvider,
   createShield,
   endWhenSettled,
   type InputScope,
   type OutputGuard,
+  requestSignal,
+  type Shield,
   type ShieldProviderOptions,
   whenSettled,
+  withInstruction,
 } from "./guard";
 import { shieldResponsesCreate } from "./openai-responses";
 import {
@@ -83,13 +86,8 @@ function instructionText(
   return text || undefined;
 }
 
-function hardenMessages(
-  messages: ChatMessage[],
-  options: HardenOptions | false
-): void {
-  if (!options) {
-    return;
-  }
+/** Hardens each system and developer message, or plants the canary in it. */
+function hardenMessages(messages: ChatMessage[], shield: Shield): void {
   for (const msg of messages) {
     if (!isInstruction(msg)) {
       continue;
@@ -98,7 +96,17 @@ function hardenMessages(
     if (!text) {
       continue;
     }
-    const hardened = harden(text, options);
+    if (!shield.harden) {
+      const instruction = shield.plant(text);
+      if (instruction && msg.content) {
+        msg.content = withInstruction(msg.content, instruction, (t) => ({
+          type: "text",
+          text: t,
+        }));
+      }
+      continue;
+    }
+    const hardened = harden(text, shield.harden);
     if (typeof msg.content === "string") {
       msg.content = hardened;
     } else if (Array.isArray(msg.content)) {
@@ -510,9 +518,9 @@ export function shieldOpenAI<
     const derivedSystemPrompt =
       options.systemPrompt ?? instructionText(params.messages);
 
-    const scope = shield.input.begin();
+    const scope = shield.input.begin(requestSignal(args[1]));
     if (params.messages) {
-      hardenMessages(params.messages, shield.harden);
+      hardenMessages(params.messages, shield);
       await checkMessages(params.messages, scope);
     }
 

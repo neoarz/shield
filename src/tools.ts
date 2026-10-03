@@ -18,12 +18,17 @@ export interface ToolScanResult {
   name: string;
   /** Detection over the tool's descriptions and schema text. */
   result: DetectResult;
-  /** Other problems with the definition itself. */
+  /**
+   * Other problems with the definition itself. `truncated` means it is
+   * longer than detection reads (`maxInputLength`), so the rest is unchecked.
+   */
   issues: Array<
     | "duplicate_name"
     | "hidden_characters_in_name"
     | "oversized_description"
     | "changed_since_pinned"
+    | "nested_too_deep"
+    | "truncated"
   >;
 }
 
@@ -56,7 +61,10 @@ const RE_INVISIBLE_IN_NAME =
   // biome-ignore lint/suspicious/noMisleadingCharacterClass: the class lists combining and format characters on purpose, to find or strip them.
   /[\u00ad\u034f\u061c\u115f\u1160\u180e\u200b-\u200f\u202a-\u202e\u2060-\u206f\ufeff]|\udb40[\udc00-\udc7f]/;
 const RE_NON_ASCII = /[^\x20-\x7e]/;
-const MAX_SCHEMA_DEPTH = 16;
+/** How deep a definition is read; one nested deeper is flagged as `nested_too_deep`. */
+const MAX_DEFINITION_DEPTH = 128;
+/** What `canonical` writes in place of a value nested deeper than the definition is read. */
+const TOO_DEEP = "[nested too deep]";
 const RE_IDENTIFIER_SEPARATORS = /[_\-.]+/g;
 const RE_CAMEL_BOUNDARY = /([a-z0-9])([A-Z])/g;
 
@@ -66,22 +74,91 @@ export function identifierWords(name: string): string {
     .replace(RE_CAMEL_BOUNDARY, "$1 $2")
     .replace(RE_IDENTIFIER_SEPARATORS, " ");
 }
-/** Schema keys whose values are free text the model reads. */
-const TEXT_KEYS = new Set([
-  "description",
-  "title",
-  "examples",
-  "example",
-  "default",
-  "enum",
-  "const",
-]);
-/** Schema keys whose values are maps from names to schemas. */
-const NAMED_KEYS = new Set([
-  "properties",
-  "patternProperties",
+/**
+ * Keys of JSON Schema and of tool definitions. Every other key, such as a
+ * parameter name or a vendor extension, is read as words, since the model
+ * reads names too.
+ */
+const STRUCTURE_KEYS = new Set([
+  "$anchor",
+  "$comment",
   "$defs",
+  "$dynamicAnchor",
+  "$dynamicRef",
+  "$id",
+  "$ref",
+  "$schema",
+  "additionalItems",
+  "additionalProperties",
+  "allOf",
+  "annotations",
+  "anyOf",
+  "const",
+  "contains",
+  "contentEncoding",
+  "contentMediaType",
+  "contentSchema",
+  "default",
   "definitions",
+  "dependencies",
+  "dependentRequired",
+  "dependentSchemas",
+  "deprecated",
+  "description",
+  "destructiveHint",
+  "else",
+  "enum",
+  "example",
+  "examples",
+  "exclusiveMaximum",
+  "exclusiveMinimum",
+  "execution",
+  "format",
+  "function",
+  "icons",
+  "idempotentHint",
+  "if",
+  "input_schema",
+  "inputSchema",
+  "items",
+  "maxContains",
+  "maximum",
+  "maxItems",
+  "maxLength",
+  "maxProperties",
+  "mimeType",
+  "minContains",
+  "minimum",
+  "minItems",
+  "minLength",
+  "minProperties",
+  "multipleOf",
+  "name",
+  "not",
+  "nullable",
+  "oneOf",
+  "openWorldHint",
+  "outputSchema",
+  "parameters",
+  "pattern",
+  "patternProperties",
+  "prefixItems",
+  "properties",
+  "propertyNames",
+  "readOnly",
+  "readOnlyHint",
+  "required",
+  "sizes",
+  "src",
+  "strict",
+  "taskSupport",
+  "then",
+  "title",
+  "type",
+  "unevaluatedItems",
+  "unevaluatedProperties",
+  "uniqueItems",
+  "writeOnly",
 ]);
 
 function asRecord(value: unknown): Record<string, unknown> | undefined {
@@ -105,10 +182,17 @@ export function schemaOf(def: Record<string, unknown>): unknown {
   );
 }
 
-/** `value` with object keys sorted at every depth, so equal definitions serialize equally. */
+/**
+ * `value` with object keys sorted at every depth, so equal definitions
+ * serialize equally. A value nested deeper than a definition is read
+ * becomes `TOO_DEEP`.
+ */
 function canonical(value: unknown, depth = 0): unknown {
-  if (depth > MAX_SCHEMA_DEPTH || value === null || typeof value !== "object") {
+  if (value === null || typeof value !== "object") {
     return value;
+  }
+  if (depth > MAX_DEFINITION_DEPTH) {
+    return TOO_DEEP;
   }
   if (Array.isArray(value)) {
     return value.map((item) => canonical(item, depth + 1));
@@ -174,71 +258,56 @@ export function pinTools(
   return out;
 }
 
+interface DefinitionText {
+  text: string;
+  /** Whether part of the definition is nested too deep to read. */
+  tooDeep: boolean;
+}
+
 /**
- * Collects the free text a model reads from a JSON schema: descriptions,
- * titles, examples, defaults, enum values, and parameter names, at any depth.
+ * The text a model reads from a tool definition: every string in it, at any
+ * depth, and every key that isn't one of `STRUCTURE_KEYS`, as words. The
+ * tool's name is left out; `scanTools` checks it for hidden characters.
  */
-function schemaText(
-  schema: unknown,
-  out: string[],
-  depth = 0,
-  inText = false
-): void {
-  if (depth > MAX_SCHEMA_DEPTH) {
-    return;
-  }
-  if (typeof schema === "string") {
-    out.push(schema);
-    return;
-  }
-  if (Array.isArray(schema)) {
-    for (const item of schema) {
-      schemaText(item, out, depth + 1, inText);
-    }
-    return;
-  }
-  const record = asRecord(schema);
-  if (!record) {
-    return;
-  }
-  for (const [key, value] of Object.entries(record)) {
-    entryText(key, value, out, depth, inText);
-  }
-}
-
-/** Collects the text of one schema entry. */
-function entryText(
-  key: string,
-  value: unknown,
-  out: string[],
-  depth: number,
-  inText: boolean
-): void {
-  if (inText || TEXT_KEYS.has(key)) {
-    if (inText) {
-      out.push(key);
-    }
-    schemaText(value, out, depth + 1, true);
-    return;
-  }
-  const names = NAMED_KEYS.has(key) ? asRecord(value) : undefined;
-  if (names) {
-    // Parameter names are read by the model too, so they can carry
-    // instructions of their own.
-    for (const name of Object.keys(names)) {
-      out.push(identifierWords(name));
-    }
-  }
-  if (value !== null && typeof value === "object") {
-    schemaText(value, out, depth + 1, false);
-  }
-}
-
-function toolText(tool: ToolDefinition): string {
+function definitionText(tool: ToolDefinition): DefinitionText {
+  const out: string[] = [];
+  let tooDeep = false;
+  const seen = new Set<object>();
+  const stack: Array<{ value: unknown; depth: number }> = [];
   const def = unwrap(tool);
-  const texts = [typeof def.description === "string" ? def.description : ""];
-  schemaText(schemaOf(def), texts);
-  return texts.filter(Boolean).join("\n");
+  for (const key of Object.keys(def).reverse()) {
+    if (key !== "name") {
+      stack.push({ value: def[key], depth: 1 });
+    }
+  }
+  for (let item = stack.pop(); item; item = stack.pop()) {
+    const { value, depth } = item;
+    if (typeof value === "string") {
+      if (value) {
+        out.push(value);
+      }
+      continue;
+    }
+    if (value === null || typeof value !== "object" || seen.has(value)) {
+      continue;
+    }
+    if (depth > MAX_DEFINITION_DEPTH) {
+      tooDeep = true;
+      continue;
+    }
+    seen.add(value);
+    const entries: [string | null, unknown][] = Array.isArray(value)
+      ? value.map((child) => [null, child])
+      : Object.entries(value);
+    for (let i = entries.length - 1; i >= 0; i--) {
+      const [key, child] = entries[i];
+      stack.push({ value: child, depth: depth + 1 });
+      if (key !== null && !STRUCTURE_KEYS.has(key)) {
+        stack.push({ value: identifierWords(key), depth });
+      }
+    }
+  }
+  return { text: out.join("\n"), tooDeep };
 }
 
 /**
@@ -268,7 +337,8 @@ export function scanTools(
     const name = String(def.name ?? "");
     const description =
       typeof def.description === "string" ? def.description : "";
-    const result = detect(toolText(tool), detectOptions);
+    const { text, tooDeep } = definitionText(tool);
+    const result = detect(text, detectOptions);
 
     const issues: ToolScanResult["issues"] = [];
     if ((counts.get(name) ?? 0) > 1) {
@@ -279,6 +349,12 @@ export function scanTools(
     }
     if (description.length > maxDescriptionLength) {
       issues.push("oversized_description");
+    }
+    if (tooDeep) {
+      issues.push("nested_too_deep");
+    }
+    if (result.truncated) {
+      issues.push("truncated");
     }
     if (pins && hasPin(pins, name) && pins[name] !== fingerprint(def)) {
       issues.push("changed_since_pinned");
@@ -306,7 +382,7 @@ export async function scanToolsAsync(
     escalate: undefined,
   });
   for (const [index, scan] of scans.tools.entries()) {
-    const text = toolText(tools[index]);
+    const { text } = definitionText(tools[index]);
     if (text) {
       const pending = slowDetection(text, scan.result, options);
       if (pending) {

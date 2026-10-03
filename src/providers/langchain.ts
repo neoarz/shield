@@ -18,9 +18,11 @@ import {
   jsonText,
   type OutputGuard,
   prefetchWhenSettled,
+  requestSignal,
   type Shield,
   type ShieldProviderOptions,
   whenSettled,
+  withInstruction,
 } from "./guard";
 import {
   hardenTextItems,
@@ -135,6 +137,22 @@ function hardenMessage(message: unknown, options: HardenOptions): unknown {
     : message;
 }
 
+/** For `harden: false`: a system message with the canary planted in it. */
+function plantCanary(message: unknown, shield: Shield): unknown {
+  if (!isRecord(message)) {
+    return message;
+  }
+  const { content } = message;
+  const instruction = shield.plant(contentText(content));
+  if (!instruction || !(typeof content === "string" || Array.isArray(content))) {
+    return message;
+  }
+  return withContent(
+    message,
+    withInstruction(content, instruction, (text) => ({ type: "text", text }))
+  );
+}
+
 async function checkMessages(
   messages: readonly unknown[],
   input: Pick<InputScope, "check">
@@ -147,16 +165,15 @@ async function checkMessages(
   }
 }
 
-/** The system prompt of `messages`: the text of the first system message. */
+/** The system prompt of `messages`: every system message's text, joined. */
 function systemPromptOf(messages: readonly unknown[]): string | undefined {
+  const texts: string[] = [];
   for (const message of messages) {
     if (roleOf(message) === "system" && isRecord(message)) {
-      const text = contentText(message.content);
-      if (text) {
-        return text;
-      }
+      texts.push(contentText(message.content));
     }
   }
+  return texts.filter(Boolean).join("\n") || undefined;
 }
 
 interface ArgsContext {
@@ -524,13 +541,14 @@ function createChatModelShield(options: ShieldChatModelOptions) {
     }
     const systemPrompt = options.systemPrompt ?? systemPromptOf(messages);
     const hardenOptions = shield.harden;
-    const prepared = hardenOptions
-      ? messages.map((message) =>
-          roleOf(message) === "system"
-            ? hardenMessage(message, hardenOptions)
-            : message
-        )
-      : messages;
+    const prepared = messages.map((message) => {
+      if (roleOf(message) !== "system") {
+        return message;
+      }
+      return hardenOptions
+        ? hardenMessage(message, hardenOptions)
+        : plantCanary(message, shield);
+    });
     await checkMessages(messages, scope);
     return { messages: prepared, systemPrompt };
   };
@@ -545,7 +563,7 @@ function createChatModelShield(options: ShieldChatModelOptions) {
     original: Method,
     [messages, callOptions, runManager, ...rest]: unknown[]
   ): Promise<unknown> => {
-    const scope = shield.input.begin();
+    const scope = shield.input.begin(requestSignal(callOptions));
     const prepared = await prepare(messages, scope);
     const active = output.active(prepared.systemPrompt);
     const tokens = active || scope.pending ? muteTokens(runManager) : undefined;
@@ -586,7 +604,7 @@ function createChatModelShield(options: ShieldChatModelOptions) {
     original: Method,
     [messages, callOptions, runManager, ...rest]: unknown[]
   ): AsyncGenerator<unknown> {
-    const scope = shield.input.begin();
+    const scope = shield.input.begin(requestSignal(callOptions));
     const prepared = await prepare(messages, scope);
     const call = (manager: unknown) =>
       original.call(

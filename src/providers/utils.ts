@@ -80,7 +80,10 @@ export interface ChunkResult extends SanitizeResult {
 export interface ChunkedSanitizer {
   /** Add text and return the sanitized text that is now safe to emit. */
   push(text: string): ChunkResult[];
-  /** Sanitize and return whatever is still held back. */
+  /**
+   * Sanitize and return whatever is still held back. Text pushed after it
+   * is scanned with the end of the text before it, as if it went on.
+   */
   flush(): ChunkResult | undefined;
 }
 
@@ -223,6 +226,13 @@ export function createChunkedSanitizer(
         // and nothing in it was redacted.
         const rest = held;
         const findings = heldFindings;
+        const window = context + rest;
+        const contextStart = Math.max(0, window.length - keep);
+        context = window.slice(contextStart);
+        offset += contextStart;
+        if (rest) {
+          endsRedacted = false;
+        }
         held = "";
         heldFindings = [];
         return rest

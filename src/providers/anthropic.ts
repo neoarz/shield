@@ -1,3 +1,4 @@
+import type { LeakDetectedError } from "../errors";
 import { type HardenOptions, harden } from "../harden";
 import {
   callProvider,
@@ -5,16 +6,18 @@ import {
   endWhenSettled,
   type InputScope,
   type OutputGuard,
+  requestSignal,
   type ShieldProviderOptions,
   whenSettled,
+  withInstruction,
 } from "./guard";
+import { withOverrides } from "./shared";
 import {
-  createSlotSanitizer,
-  type SlotSanitizer,
-  type TextSlot,
-  withOverrides,
-} from "./shared";
-import { chunkString, isAsyncIterable } from "./utils";
+  type ChunkResult,
+  chunkString,
+  createChunkedSanitizer,
+  isAsyncIterable,
+} from "./utils";
 
 export interface ShieldAnthropicOptions extends ShieldProviderOptions {}
 
@@ -204,8 +207,9 @@ function segmentField(event: StreamEvent): Segment["field"] | undefined {
 }
 
 /**
- * Reads the whole stream, guards the full text and tool input of each
- * content block, and replays the events. Nothing else in them changes.
+ * Reads the whole stream, guards the text blocks as one text and the tool
+ * input of each block on its own, and replays the events. Nothing else in
+ * them changes.
  */
 async function bufferStream(
   stream: AsyncIterable<StreamEvent>,
@@ -227,7 +231,20 @@ async function bufferStream(
   }
 
   const rewritten = new Map<string, Segment>();
+  const texts = [...segments].filter(([, segment]) => segment.field === "text");
+  const safeTexts = output.texts(
+    texts.map(([, segment]) => segment.text),
+    systemPrompt
+  );
+  for (const [i, [key, segment]] of texts.entries()) {
+    if (safeTexts[i] !== segment.text) {
+      rewritten.set(key, { field: "text", text: safeTexts[i] });
+    }
+  }
   for (const [key, segment] of segments) {
+    if (segment.field === "text") {
+      continue;
+    }
     const safe = segment.text
       ? output.text(segment.text, systemPrompt)
       : segment.text;
@@ -242,9 +259,62 @@ async function bufferStream(
   })();
 }
 
+/**
+ * Guards streamed text in chunks: `push` returns what is safe to emit, and
+ * `flush` the rest. A blocked finding throws right away; a leak with
+ * `throwOnLeak` is kept for `finish()`, as the OpenAI wrapper does.
+ */
+interface BlockSanitizer {
+  push(text: string): string;
+  /** Text pushed after it is scanned with the end of what came before. */
+  flush(): string;
+  finish(): void;
+}
+
+function createBlockSanitizer(
+  systemPrompt: string,
+  output: OutputGuard,
+  options: ShieldAnthropicOptions
+): BlockSanitizer {
+  const chunkSize = options.streamingChunkSize ?? 8192;
+  const sanitizer = createChunkedSanitizer(
+    systemPrompt,
+    output.scanWindow,
+    chunkSize,
+    output.overlap(chunkSize)
+  );
+  let leak: LeakDetectedError | undefined;
+
+  const emit = (results: ChunkResult[]): string => {
+    let text = "";
+    for (const result of results) {
+      const verdict = output.report(result);
+      leak ??= verdict.leak;
+      if (verdict.block && !(verdict.leak && options.throwOnLeak)) {
+        throw verdict.block;
+      }
+      text += result.sanitized;
+    }
+    return text;
+  };
+
+  return {
+    push: (text) => emit(sanitizer.push(text)),
+    flush() {
+      const last = sanitizer.flush();
+      return last ? emit([last]) : "";
+    },
+    finish() {
+      if (leak && options.throwOnLeak) {
+        throw leak;
+      }
+    },
+  };
+}
+
 /** A content block being streamed in chunked mode. */
 interface OpenBlock {
-  sanitizer: SlotSanitizer;
+  sanitizer: BlockSanitizer;
   field: Segment["field"];
   /** The block's last delta event, the shape for what is flushed. */
   template: StreamEvent;
@@ -252,11 +322,13 @@ interface OpenBlock {
 
 /**
  * Guards the text and tool input JSON of each content block in chunks and
- * replays the events with the guarded text in place of the original. Delta
- * events whose text is all held back are left out, and what a block still
- * holds back goes out in one more delta ahead of its `content_block_stop`.
- * Every other event passes through in order. With `throwOnLeak`, a leak is
- * thrown once everything was emitted.
+ * replays the events with the guarded text in place of the original. Text
+ * blocks, which come one after another, share a sanitizer, so each is
+ * scanned with the end of the one before it. Delta events whose text is all
+ * held back are left out, and what a block still holds back goes out in one
+ * more delta ahead of its `content_block_stop`. Every other event passes
+ * through in order. With `throwOnLeak`, a leak is thrown once everything was
+ * emitted.
  */
 async function* chunkedStream(
   stream: AsyncIterable<StreamEvent>,
@@ -265,7 +337,21 @@ async function* chunkedStream(
   options: ShieldAnthropicOptions
 ): AsyncGenerator<StreamEvent> {
   const open = new Map<string, OpenBlock>();
-  const finished: SlotSanitizer[] = [];
+  const sanitizers: BlockSanitizer[] = [];
+  let text: BlockSanitizer | undefined;
+
+  const sanitizerFor = (field: Segment["field"]): BlockSanitizer => {
+    const textOpen = [...open.values()].some((block) => block.field === "text");
+    if (field === "text" && text && !textOpen) {
+      return text;
+    }
+    const sanitizer = createBlockSanitizer(systemPrompt ?? "", output, options);
+    sanitizers.push(sanitizer);
+    if (field === "text" && !textOpen) {
+      text = sanitizer;
+    }
+    return sanitizer;
+  };
 
   function* flush(key: string): Generator<StreamEvent> {
     const block = open.get(key);
@@ -273,11 +359,10 @@ async function* chunkedStream(
       return;
     }
     open.delete(key);
-    finished.push(block.sanitizer);
-    const text = block.sanitizer.flush().get(key);
-    if (text) {
+    const rest = block.sanitizer.flush();
+    if (rest) {
       const { template, field } = block;
-      yield { ...template, delta: { ...template.delta, [field]: text } };
+      yield { ...template, delta: { ...template.delta, [field]: rest } };
     }
   }
 
@@ -293,31 +378,19 @@ async function* chunkedStream(
     }
     let block = open.get(key);
     if (!block) {
-      block = {
-        sanitizer: createSlotSanitizer(systemPrompt ?? "", output, options),
-        field,
-        template: event,
-      };
+      block = { sanitizer: sanitizerFor(field), field, template: event };
       open.set(key, block);
     }
     block.template = event;
-    const delta = { ...event.delta };
-    const slot: TextSlot = {
-      key,
-      text: delta[field] ?? "",
-      set: (text) => {
-        delta[field] = text;
-      },
-    };
-    block.sanitizer.push([slot]);
-    if (delta[field]) {
-      yield { ...event, delta };
+    const safe = block.sanitizer.push(event.delta?.[field] ?? "");
+    if (safe) {
+      yield { ...event, delta: { ...event.delta, [field]: safe } };
     }
   }
   for (const key of [...open.keys()]) {
     yield* flush(key);
   }
-  for (const sanitizer of finished) {
+  for (const sanitizer of sanitizers) {
     sanitizer.finish();
   }
 }
@@ -343,7 +416,16 @@ async function guardStream(
     : await bufferStream(endWhenSettled(scope, stream), systemPrompt, output);
 }
 
-/** Guards text blocks and tool inputs of a message, in place. */
+function isTextBlock(block: unknown): block is Block & { text: string } {
+  return (
+    isBlock(block) && block.type === "text" && typeof block.text === "string"
+  );
+}
+
+/**
+ * Guards the text blocks of a message as one text, since citations split a
+ * reply into many, and each tool input on its own. In place.
+ */
 function guardMessage(
   response: unknown,
   systemPrompt: string | undefined,
@@ -353,10 +435,12 @@ function guardMessage(
   if (!Array.isArray(content)) {
     return;
   }
+  const texts = content.filter(isTextBlock);
+  const safe = output.texts(texts.map((block) => block.text), systemPrompt);
+  for (const [i, block] of texts.entries()) {
+    block.text = safe[i];
+  }
   for (const block of content) {
-    if (block?.type === "text" && typeof block.text === "string") {
-      block.text = output.text(block.text, systemPrompt);
-    }
     if (
       block?.type === "tool_use" &&
       block.input &&
@@ -425,10 +509,16 @@ export function shieldAnthropic<
 
     const derivedSystemPrompt =
       options.systemPrompt ?? systemText(params.system);
+    const instruction = shield.plant(systemText(params.system) ?? "");
     if (shield.harden && params.system) {
       params.system = hardenSystem(params.system, shield.harden);
+    } else if (instruction && params.system) {
+      params.system = withInstruction(params.system, instruction, (text) => ({
+        type: "text",
+        text,
+      }));
     }
-    const scope = shield.input.begin();
+    const scope = shield.input.begin(requestSignal(args[1]));
     if (params.messages) {
       await checkMessages(params.messages, scope);
     }

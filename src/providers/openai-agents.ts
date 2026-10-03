@@ -118,7 +118,11 @@ export interface ShieldToolPolicyGuardrail {
 
 type InjectionOptions = Pick<
   ShieldProviderOptions,
-  "detect" | "scanToolResults" | "onDetection" | "onInjectionDetected"
+  | "detect"
+  | "scanToolResults"
+  | "onDetection"
+  | "onInjectionDetected"
+  | "requireFullCoverage"
 >;
 
 export interface ShieldInputGuardrailOptions extends InjectionOptions {
@@ -277,8 +281,8 @@ function itemText(item: unknown): string {
 
 /**
  * Text of what a function tool returned: a string, a content part or MCP
- * content block, a list of those, or the string values of anything else, up
- * to 64KB. Images, files, and audio are not read.
+ * content block, a list of those, or the string values of anything else.
+ * Images, files, and audio are not read.
  */
 function toolOutputText(output: unknown): string {
   return Array.isArray(output)
@@ -366,6 +370,7 @@ function createInjectionCheck(options: InjectionOptions) {
     scanToolResults: options.scanToolResults,
     onDetection: options.onDetection,
     onInjectionDetected: options.onInjectionDetected,
+    requireFullCoverage: options.requireFullCoverage,
     harden: false,
     sanitize: false,
     output: false,

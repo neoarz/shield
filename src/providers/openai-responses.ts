@@ -9,9 +9,11 @@ import {
   callProvider,
   type InputScope,
   type OutputGuard,
+  requestSignal,
   type Shield,
   type ShieldProviderOptions,
   whenSettled,
+  withInstruction,
 } from "./guard";
 import { chunkString, isAsyncIterable } from "./utils";
 
@@ -170,6 +172,34 @@ function hardenParams(
   }
 }
 
+/**
+ * For `harden: false`: plants the canary in the instructions and in each
+ * system and developer message.
+ */
+function plantCanary(
+  params: ResponsesParams,
+  items: InputItem[],
+  shield: Shield
+): void {
+  const { instructions } = params;
+  const instruction =
+    typeof instructions === "string" ? shield.plant(instructions) : undefined;
+  if (instruction) {
+    params.instructions = `${instructions}\n\n${instruction}`;
+  }
+  for (const item of items) {
+    const added = isSystemMessage(item)
+      ? shield.plant(inputText(item.content))
+      : undefined;
+    if (added && item.content !== undefined) {
+      item.content = withInstruction(item.content, added, (t) => ({
+        type: "input_text",
+        text: t,
+      }));
+    }
+  }
+}
+
 async function checkInput(
   params: ResponsesParams,
   items: InputItem[],
@@ -188,21 +218,49 @@ async function checkInput(
 }
 
 /** Guards each text once per key, so every event that repeats it agrees. */
-type Lookup = (key: string, text: string) => string;
+interface Lookup {
+  one(key: string, text: string): string;
+  /** Texts that read as one, such as the parts of a message, guarded together. */
+  all(keys: readonly string[], texts: readonly string[]): string[];
+}
 
 function createLookup(
   output: OutputGuard,
   systemPrompt: string | undefined
 ): Lookup {
   const seen = new Map<string, { text: string; safe: string }>();
-  return (key, text) => {
+  const cached = (key: string, text: string): string | undefined => {
     const hit = seen.get(key);
-    if (hit && hit.text === text) {
-      return hit.safe;
-    }
-    const safe = output.text(text, systemPrompt);
-    seen.set(key, { text, safe });
-    return safe;
+    return hit && hit.text === text ? hit.safe : undefined;
+  };
+  return {
+    one(key, text) {
+      const hit = cached(key, text);
+      if (hit !== undefined) {
+        return hit;
+      }
+      const safe = output.text(text, systemPrompt);
+      seen.set(key, { text, safe });
+      return safe;
+    },
+    all(keys, texts) {
+      const hits: string[] = [];
+      for (const [i, key] of keys.entries()) {
+        const hit = cached(key, texts[i]);
+        if (hit === undefined) {
+          break;
+        }
+        hits.push(hit);
+      }
+      if (hits.length === keys.length) {
+        return hits;
+      }
+      const safe = output.texts(texts, systemPrompt);
+      for (const [i, key] of keys.entries()) {
+        seen.set(key, { text: texts[i], safe: safe[i] });
+      }
+      return safe;
+    },
   };
 }
 
@@ -218,20 +276,31 @@ function withText(part: OutputPart, text: string): OutputPart {
     : { ...part, text };
 }
 
+function isOutputText(
+  part: OutputPart | undefined
+): part is OutputPart & { text: string } {
+  return part?.type === "output_text" && typeof part.text === "string";
+}
+
+/** A message with its text parts guarded as one text, as `output_text` joins them. */
 function rewriteMessage(
   item: OutputItem & { content: OutputPart[] },
   id: string,
   lookup: Lookup
 ): OutputItem {
+  const parts = [...item.content.entries()].filter(
+    (entry): entry is [number, OutputPart & { text: string }] =>
+      isOutputText(entry[1])
+  );
+  const safe = lookup.all(
+    parts.map(([i]) => textKey(id, i)),
+    parts.map(([, part]) => part.text)
+  );
   let content: OutputPart[] | undefined;
-  for (const [i, part] of item.content.entries()) {
-    if (part?.type !== "output_text" || typeof part.text !== "string") {
-      continue;
-    }
-    const safe = lookup(textKey(id, i), part.text);
-    if (safe !== part.text) {
+  for (const [n, [i, part]] of parts.entries()) {
+    if (safe[n] !== part.text) {
       content ??= [...item.content];
-      content[i] = withText(part, safe);
+      content[i] = withText(part, safe[n]);
     }
   }
   return content ? { ...item, content } : item;
@@ -256,7 +325,7 @@ function rewriteItem(item: OutputItem, id: string, lookup: Lookup): OutputItem {
   if (!field || typeof value !== "string") {
     return item;
   }
-  const safe = lookup(
+  const safe = lookup.one(
     field === "arguments" ? argumentsKey(id) : inputKey(id),
     value
   );
@@ -335,16 +404,26 @@ function* replaceDeltas(
 
 interface StreamGuard {
   handle(event: StreamEvent): Iterable<StreamEvent>;
-  /** Deltas whose done event never came. */
+  /** What is still held: a message that never ended, and deltas whose done event never came. */
   finish(): Iterable<StreamEvent>;
+}
+
+/** Whether `event` ends the output item that `start` belongs to. */
+function endsItem(event: StreamEvent, start: StreamEvent): boolean {
+  return (
+    event?.type === "response.output_item.done" &&
+    (event.output_index === start.output_index ||
+      (event.item?.id !== undefined && event.item.id === start.item_id))
+  );
 }
 
 /**
  * Holds back text, function call argument, and custom tool input deltas
  * until their `done` event, guards the full text, and re-emits it in 64-character deltas
- * shaped like the originals. Events that repeat the text (content part,
- * output item, and the final response) carry the guarded version. Every other
- * event passes through in order.
+ * shaped like the originals. A message is held from its first text delta
+ * until it is done, so its text parts are guarded as one text. Events that
+ * repeat the text (content part, output item, and the final response) carry
+ * the guarded version. Every other event passes through in order.
  */
 function createStreamGuard(lookup: Lookup): StreamGuard {
   const held = new Map<string, StreamEvent[]>();
@@ -368,7 +447,7 @@ function createStreamGuard(lookup: Lookup): StreamGuard {
     const streamed = deltas.map((d) => d.delta ?? "").join("");
     const value = done[field];
     const full = typeof value === "string" ? value : streamed;
-    const safe = lookup(key, full);
+    const safe = lookup.one(key, full);
     yield* replaceDeltas(deltas, streamed, safe);
     if (safe === full) {
       yield done;
@@ -386,7 +465,10 @@ function createStreamGuard(lookup: Lookup): StreamGuard {
     if (part?.type !== "output_text" || typeof part.text !== "string") {
       return event;
     }
-    const safe = lookup(textKey(event.item_id, event.content_index), part.text);
+    const safe = lookup.one(
+      textKey(event.item_id, event.content_index),
+      part.text
+    );
     return safe === part.text
       ? event
       : { ...event, part: withText(part, safe) };
@@ -435,15 +517,61 @@ function createStreamGuard(lookup: Lookup): StreamGuard {
     "response.failed": (e) => [rewriteFinal(e)],
   };
 
+  const step = (event: StreamEvent): Iterable<StreamEvent> => {
+    const handler = handlers[event?.type ?? ""];
+    return handler ? handler(event) : [event];
+  };
+
+  /** The events of the message being held, from its first text delta. */
+  let message: StreamEvent[] | undefined;
+
+  /**
+   * Guards the text parts of the held message as one text, then lets its
+   * events through, where each part's release finds its share.
+   */
+  const releaseMessage = (): StreamEvent[] => {
+    if (!message) {
+      return [];
+    }
+    const events = message;
+    const [start] = events;
+    message = undefined;
+    const texts = new Map<string, string>();
+    for (const event of events) {
+      if (event.item_id !== start.item_id) {
+        continue;
+      }
+      const key = textKey(event.item_id, event.content_index);
+      if (event.type === "response.output_text.delta") {
+        texts.set(key, (texts.get(key) ?? "") + (event.delta ?? ""));
+      } else if (
+        event.type === "response.output_text.done" &&
+        typeof event.text === "string"
+      ) {
+        texts.set(key, event.text);
+      }
+    }
+    lookup.all([...texts.keys()], [...texts.values()]);
+    return events.flatMap((event) => [...step(event)]);
+  };
+
   return {
     handle(event) {
-      const handler = handlers[event?.type ?? ""];
-      return handler ? handler(event) : [event];
+      if (message) {
+        message.push(event);
+        return endsItem(event, message[0]) ? releaseMessage() : [];
+      }
+      if (event?.type === "response.output_text.delta") {
+        message = [event];
+        return [];
+      }
+      return step(event);
     },
     *finish() {
+      yield* releaseMessage();
       for (const [key, deltas] of held) {
         const text = deltas.map((d) => d.delta ?? "").join("");
-        yield* replaceDeltas(deltas, text, lookup(key, text));
+        yield* replaceDeltas(deltas, text, lookup.one(key, text));
       }
       held.clear();
     },
@@ -479,7 +607,8 @@ function guardResponse(response: unknown, lookup: Lookup): void {
 
 /**
  * Wraps `responses.create`. `"chunked"` streaming works like `"buffer"`: each
- * text is held until its `done` event.
+ * message's text is held until the message is done, and each tool call's
+ * arguments until their `done` event.
  */
 export function shieldResponsesCreate(
   originalCreate: (...args: unknown[]) => unknown,
@@ -500,8 +629,10 @@ export function shieldResponsesCreate(
     const items = Array.isArray(params.input) ? params.input : [];
     if (shield.harden) {
       hardenParams(params, items, shield.harden);
+    } else {
+      plantCanary(params, items, shield);
     }
-    const scope = shield.input.begin();
+    const scope = shield.input.begin(requestSignal(args[1]));
     await checkInput(params, items, scope);
 
     const response = await callProvider(scope, () => originalCreate(...args));

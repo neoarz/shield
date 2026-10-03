@@ -6,11 +6,7 @@
 
 import type { LeakDetectedError } from "../errors";
 import { type HardenOptions, harden } from "../harden";
-import {
-  MAX_TOOL_TEXT,
-  type OutputGuard,
-  type ShieldProviderOptions,
-} from "./guard";
+import type { OutputGuard, ShieldProviderOptions } from "./guard";
 import {
   type ChunkedSanitizer,
   type ChunkResult,
@@ -21,32 +17,38 @@ export function isRecord(value: unknown): value is Record<string, unknown> {
   return typeof value === "object" && value !== null;
 }
 
-const TEXT_MIME = /^(text\/|application\/(json|xml)\b)/i;
+const TEXT_MIME =
+  /^(text\/|application\/([\w.-]+\+)?(json|xml|yaml|x-yaml|javascript|ecmascript|toml)\b)/i;
+const MEDIA_MIME = /^(image|audio|video)\//i;
 
 /**
- * The text of base64 `data` with a `text/*`, `application/json`, or
- * `application/xml` MIME type, up to 64KB. Empty for any other data.
+ * The text of base64 `data`. Data with a text MIME type
+ * (`text/*`, JSON, XML, YAML, JavaScript, or TOML, including types such as
+ * `application/ld+json`) is decoded as UTF-8; data with any other type, or
+ * none, is decoded when its bytes are valid UTF-8. Empty for image, audio,
+ * and video, which a model doesn't read as text, and for binary data.
  */
 export function decodeTextBlob(data: unknown, mimeType: unknown): string {
-  if (
-    !(
-      typeof data === "string" &&
-      typeof mimeType === "string" &&
-      TEXT_MIME.test(mimeType)
-    )
-  ) {
+  const type = typeof mimeType === "string" ? mimeType : "";
+  if (typeof data !== "string" || MEDIA_MIME.test(type)) {
     return "";
   }
-  const size = Math.ceil(MAX_TOOL_TEXT / 3) * 4;
   let binary: string;
   try {
-    binary = atob(data.slice(0, size));
+    binary = atob(data);
   } catch {
     // Not base64: the provider rejects it anyway.
     return "";
   }
   const bytes = Uint8Array.from(binary, (c) => c.charCodeAt(0));
-  return new TextDecoder().decode(bytes);
+  if (TEXT_MIME.test(type)) {
+    return new TextDecoder().decode(bytes);
+  }
+  try {
+    return new TextDecoder("utf-8", { fatal: true }).decode(bytes);
+  } catch {
+    return "";
+  }
 }
 
 /**
@@ -212,29 +214,30 @@ export function createSlotSanitizer(
 /**
  * Chunked streaming with the chunks re-emitted one behind, so the text each
  * key still holds back at the end goes into the last chunk, ahead of what
- * it carries (a finish reason, usage).
+ * it carries (a finish reason, usage). While `holding()` is true, chunks
+ * are kept back instead.
  */
 export async function* chunkedReplay<C>(
   stream: AsyncIterable<C>,
   sanitizer: SlotSanitizer,
   slotsOf: (chunk: C) => TextSlot[],
-  append: (chunk: C, key: string, text: string) => void
+  append: (chunk: C, key: string, text: string) => void,
+  holding: () => boolean = () => false
 ): AsyncGenerator<C> {
-  let last: C | undefined;
-  let held = false;
+  const held: C[] = [];
   for await (const chunk of stream) {
     sanitizer.push(slotsOf(chunk));
-    if (held) {
-      yield last as C;
+    held.push(chunk);
+    if (!holding()) {
+      yield* held.splice(0, held.length - 1);
     }
-    last = chunk;
-    held = true;
   }
-  if (held) {
+  if (held.length > 0) {
+    const last = held[held.length - 1];
     for (const [key, text] of sanitizer.flush()) {
-      append(last as C, key, text);
+      append(last, key, text);
     }
-    yield last as C;
+    yield* held.splice(0);
   }
   sanitizer.finish();
 }

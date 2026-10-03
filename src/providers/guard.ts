@@ -68,6 +68,13 @@ export interface ShieldProviderOptions {
   /** Chunk size for "chunked" mode (default 8192). */
   streamingChunkSize?: number;
   onDetection?: "block" | "warn";
+  /**
+   * Treat text longer than detection reads (`maxInputLength`, 1MB by
+   * default) as an injection with category `truncated`, since the rest of
+   * it is unchecked. Default `false`: only its first `maxInputLength`
+   * characters are checked.
+   */
+  requireFullCoverage?: boolean;
   throwOnLeak?: boolean;
   /** Called on every detection, with where it was found. */
   onInjectionDetected?: (result: DetectResult, source: InjectionSource) => void;
@@ -78,11 +85,16 @@ export interface ShieldProviderOptions {
   onOutputFindings?: (findings: OutputFinding[]) => void;
   /** Throw OutputBlockedError instead of redacting when a finding is high or critical severity. */
   blockOnOutputFindings?: boolean;
-  /** Plant a canary token in the hardened system prompt and treat its appearance in output as a leak. `true` creates one per wrapper instance. */
+  /**
+   * Plant a canary token in the hardened system prompt and treat its
+   * appearance in output as a leak. `true` creates one per wrapper instance.
+   * With `harden: false`, only the canary's instruction is added to a system
+   * prompt that doesn't hold the canary yet.
+   */
   canary?: string | boolean;
 }
 
-/** How much of a JSON tool result's string values is scanned, and the longest text cached. */
+/** The longest text whose detection result is cached. */
 export const MAX_TOOL_TEXT = 64 * 1024;
 const CACHE_ENTRIES = 256;
 /** Output scanning holds back more text in chunked mode, for long findings. */
@@ -97,22 +109,22 @@ const SEVERITY_RANK: Record<Severity, number> = {
 };
 
 /**
- * The strings in a JSON value, joined with newlines, up to 64KB. Keys are
- * left out, since the model reads them as structure rather than
- * instructions.
+ * The strings in a JSON value, then its keys, each in order and joined with
+ * newlines. All of them: detection windows long text itself, and a capped
+ * scan would let an injection hide behind filler. The strings come
+ * together, so an instruction split across values reads as one, and the
+ * keys follow, since the model reads them too.
  */
-export function jsonText(value: unknown, limit = MAX_TOOL_TEXT): string {
-  const parts: string[] = [];
-  let size = 0;
+export function jsonText(value: unknown): string {
+  const strings: string[] = [];
+  const keys: string[] = [];
   const stack: unknown[] = [value];
   const seen = new Set<object>();
-  while (stack.length > 0 && size < limit) {
+  while (stack.length > 0) {
     const item = stack.pop();
     if (typeof item === "string") {
       if (item) {
-        const part = item.slice(0, limit - size);
-        parts.push(part);
-        size += part.length + 1;
+        strings.push(item);
       }
       continue;
     }
@@ -120,12 +132,17 @@ export function jsonText(value: unknown, limit = MAX_TOOL_TEXT): string {
       continue;
     }
     seen.add(item);
+    if (!Array.isArray(item)) {
+      for (const key of Object.keys(item)) {
+        keys.push(key);
+      }
+    }
     const children = Array.isArray(item) ? item : Object.values(item);
     for (let i = children.length - 1; i >= 0; i--) {
       stack.push(children[i]);
     }
   }
-  return parts.join("\n");
+  return [...strings, ...keys.filter(Boolean)].join("\n");
 }
 
 interface Lru<V> {
@@ -162,8 +179,17 @@ export interface InputGuard {
   readonly user: boolean;
   /** Whether tool results are checked. */
   readonly tool: boolean;
-  /** Reports an injection in `text`, and throws unless `onDetection` is "warn". Runs `secondaryDetector` and `escalate`. */
-  check(text: string, source: InjectionSource): Promise<void>;
+  /**
+   * Reports an injection in `text` (or, with `requireFullCoverage`, text
+   * longer than detection reads), and throws unless `onDetection` is
+   * "warn". Runs `secondaryDetector` and `escalate`; once `signal` aborts,
+   * throws its reason without waiting for them.
+   */
+  check(
+    text: string,
+    source: InjectionSource,
+    signal?: AbortSignal
+  ): Promise<void>;
   /** Same, without `secondaryDetector` and `escalate`. */
   checkSync(text: string, source: InjectionSource): void;
   /**
@@ -176,8 +202,11 @@ export interface InputGuard {
     text: string,
     source: InjectionSource
   ): Promise<DetectResult | undefined>;
-  /** The checks of one request. Never share a scope between requests. */
-  begin(): InputScope;
+  /**
+   * The checks of one request, whose abort `signal` stops the wait for
+   * slow verdicts. Never share a scope between requests.
+   */
+  begin(signal?: AbortSignal): InputScope;
 }
 
 /**
@@ -185,13 +214,16 @@ export interface InputGuard {
  * `InputGuard.check` and `settle` does nothing. With it, `check` reports
  * what the fast check finds right away, as `InputGuard.check` would, and
  * starts `escalate` without waiting for it; `settle` waits for every
- * verdict it started, in order, and reports them the same way.
+ * verdict it started, in order, and reports them the same way. Once the
+ * request's signal aborts, both throw its reason instead of waiting.
  */
 export interface InputScope {
   /** Whether tool results are checked. */
   readonly tool: boolean;
   /** Whether a verdict `check` started has not settled cleanly yet. */
   readonly pending: boolean;
+  /** The request's abort signal. */
+  readonly signal?: AbortSignal;
   check(text: string, source: InjectionSource): Promise<void>;
   /**
    * Waits for the verdicts `check` started and reports them: throws
@@ -202,6 +234,45 @@ export interface InputScope {
 }
 
 const noop = (): void => undefined;
+
+/** `promise`, or a rejection with `signal`'s reason as soon as it aborts. */
+function abortable<T>(
+  promise: Promise<T>,
+  signal: AbortSignal | undefined
+): Promise<T> {
+  if (!signal) {
+    return promise;
+  }
+  if (signal.aborted) {
+    promise.catch(noop);
+    return Promise.reject(signal.reason);
+  }
+  return new Promise<T>((resolve, reject) => {
+    const abort = (): void => reject(signal.reason);
+    signal.addEventListener("abort", abort, { once: true });
+    promise
+      .then(resolve, reject)
+      .finally(() => signal.removeEventListener("abort", abort));
+  });
+}
+
+/**
+ * `result`, or a detection when the text was longer than detection reads
+ * (`maxInputLength`), since the rest can hold an injection.
+ */
+function failClosed(result: DetectResult): DetectResult {
+  if (result.detected || !result.truncated) {
+    return result;
+  }
+  return {
+    ...result,
+    detected: true,
+    risk: "high",
+    matches: [
+      { category: "truncated", pattern: "maxInputLength", confidence: 1 },
+    ],
+  };
+}
 
 /** Whether `detectAsync` can give a different result than `detect`. */
 function hasAsyncDetector(options: DetectOptions): boolean {
@@ -241,7 +312,11 @@ function createInputGuard(options: ShieldProviderOptions): InputGuard {
       ? undefined
       : `${source}:${text}`;
 
-  const report = (result: DetectResult, source: InjectionSource): void => {
+  const verdictOf = (result: DetectResult): DetectResult =>
+    options.requireFullCoverage ? failClosed(result) : result;
+
+  const report = (scanned: DetectResult, source: InjectionSource): void => {
+    const result = verdictOf(scanned);
     if (!result.detected) {
       return;
     }
@@ -273,33 +348,39 @@ function createInputGuard(options: ShieldProviderOptions): InputGuard {
 
   const run = async (
     text: string,
-    source: InjectionSource
+    source: InjectionSource,
+    signal?: AbortSignal
   ): Promise<DetectResult | undefined> => {
     const detectOptions = optionsFor(source);
     if (!(detectOptions && text)) {
       return;
     }
     return hasAsyncDetector(detectOptions)
-      ? await detectAsync(text, detectOptions)
+      ? await abortable(detectAsync(text, detectOptions), signal)
       : detectSync(text, source, detectOptions);
   };
 
   const user = byUser !== null;
   const tool = byTool !== null;
-  const check = async (text: string, source: InjectionSource) => {
-    const result = await run(text, source);
+  const check = async (
+    text: string,
+    source: InjectionSource,
+    signal?: AbortSignal
+  ) => {
+    const result = await run(text, source, signal);
     if (result) {
       report(result, source);
     }
   };
-  const serial: InputScope = {
+  const serialScope = (signal?: AbortSignal): InputScope => ({
     tool,
     pending: false,
-    check,
+    signal,
+    check: (text, source) => check(text, source, signal),
     settle: () => Promise.resolve(),
-  };
+  });
 
-  const parallelScope = (): InputScope => {
+  const parallelScope = (signal?: AbortSignal): InputScope => {
     const started: Array<{
       verdict: Promise<DetectResult>;
       source: InjectionSource;
@@ -318,6 +399,7 @@ function createInputGuard(options: ShieldProviderOptions): InputGuard {
       get pending() {
         return pending;
       },
+      signal,
       async check(text, source) {
         const detectOptions = optionsFor(source);
         if (!(detectOptions && text)) {
@@ -328,7 +410,12 @@ function createInputGuard(options: ShieldProviderOptions): InputGuard {
           return;
         }
         const result = detect(text, detectOptions);
-        const slow = slowDetection(text, result, detectOptions);
+        // No slower verdict covers text past what detection reads, so with
+        // requireFullCoverage it is reported at once.
+        const slow =
+          options.requireFullCoverage && result.truncated
+            ? undefined
+            : slowDetection(text, result, detectOptions);
         if (!slow) {
           report(result, source);
           return;
@@ -336,7 +423,7 @@ function createInputGuard(options: ShieldProviderOptions): InputGuard {
         if (result.detected) {
           // Text the fast check flagged waits for the secondaryDetector, so
           // it never reaches the provider unless the verifier clears it.
-          report(await slow, source);
+          report(await abortable(slow, signal), source);
           return;
         }
         // Left unawaited if a later check throws first.
@@ -357,7 +444,7 @@ function createInputGuard(options: ShieldProviderOptions): InputGuard {
             }
           }, noop);
         }
-        return settling ?? Promise.resolve();
+        return settling ? abortable(settling, signal) : Promise.resolve();
       },
     };
   };
@@ -373,14 +460,41 @@ function createInputGuard(options: ShieldProviderOptions): InputGuard {
       }
     },
     async inspect(text, source) {
-      const result = await run(text, source);
+      const scanned = await run(text, source);
+      const result = scanned && verdictOf(scanned);
       if (result?.detected) {
         options.onInjectionDetected?.(result, source);
       }
       return result;
     },
-    begin: options.parallelDetection ? parallelScope : () => serial,
+    begin: options.parallelDetection ? parallelScope : serialScope,
   };
+}
+
+/** Whether `value` is an `AbortSignal`, the platform's or a polyfill's. */
+function isAbortSignal(value: unknown): value is AbortSignal {
+  const signal = value as Partial<AbortSignal> | null | undefined;
+  return (
+    typeof signal?.aborted === "boolean" &&
+    typeof signal.addEventListener === "function"
+  );
+}
+
+/**
+ * The abort signal of a request: `signal` in the request options of the
+ * OpenAI, Anthropic, Mistral, and LangChain SDKs, or `abortSignal` in the
+ * Google and AI SDK request params.
+ */
+export function requestSignal(options: unknown): AbortSignal | undefined {
+  if (typeof options !== "object" || options === null) {
+    return;
+  }
+  const { signal, abortSignal } = options as {
+    signal?: unknown;
+    abortSignal?: unknown;
+  };
+  const value = signal ?? abortSignal;
+  return isAbortSignal(value) ? value : undefined;
 }
 
 /** Closes `iterator` without waiting for it. */
@@ -421,7 +535,8 @@ function discard(value: unknown, iterator?: AsyncIterator<unknown>): void {
 /**
  * Calls the provider. If the call fails, the verdicts `scope` started are
  * waited for first and their error wins, as it would have with the checks
- * run before the call.
+ * run before the call; if the request was aborted, its own error is thrown
+ * right away.
  */
 export async function callProvider<T>(
   scope: InputScope,
@@ -430,7 +545,9 @@ export async function callProvider<T>(
   try {
     return await call();
   } catch (error) {
-    await scope.settle();
+    if (!scope.signal?.aborted) {
+      await scope.settle();
+    }
     throw error;
   }
 }
@@ -454,8 +571,8 @@ export async function whenSettled<T>(scope: InputScope, value: T): Promise<T> {
  * verdict `scope` started is in, for buffer mode: the stream is read while
  * they come in, and nothing reaches the caller before they are. A blocking
  * verdict stops the stream and is thrown right away; an error from the
- * stream waits for the verdicts, whose error wins. Returns `stream` itself
- * when nothing is pending.
+ * stream waits for the verdicts, whose error wins, unless the request was
+ * aborted. Returns `stream` itself when nothing is pending.
  */
 export function endWhenSettled<T>(
   scope: InputScope,
@@ -483,7 +600,9 @@ async function* readUntilSettled<T>(
       }
     }
   } catch (error) {
-    await settled;
+    if (!scope.signal?.aborted) {
+      await settled;
+    }
     throw error;
   } finally {
     if (!done) {
@@ -545,6 +664,13 @@ export interface OutputGuard {
   /** `text()` for every string in a JSON-like value, reported once. Returns `value` itself when nothing changed. */
   value<T>(value: T, systemPrompt: string | undefined): T;
   /**
+   * `text()` for strings that read as one text, such as the text blocks of
+   * a reply: scans them joined, so a leak split across them is found, and
+   * reports once. Returns each string with the redactions that fall in it;
+   * one that runs on from an earlier string is replaced there.
+   */
+  texts(texts: readonly string[], systemPrompt: string | undefined): string[];
+  /**
    * Scans a string, or every string in a JSON-like value, and reports what
    * it found like `text()` and `value()`, but returns the errors instead of
    * throwing them. `leak` is set for any prompt leak or canary, whatever
@@ -588,18 +714,33 @@ function isBlocking(finding: OutputFinding): boolean {
   return SEVERITY_RANK[finding.severity] >= SEVERITY_RANK.high;
 }
 
-function applyRedactions(text: string, scan: WindowScan): string {
-  if (scan.redactions.length === 0) {
-    return text;
-  }
+/**
+ * `text` from `from` to `to` with `scan`'s redactions applied. A redaction
+ * that starts before `from` continues one already replaced, so only the
+ * text it covers is dropped.
+ */
+function applyRedactions(
+  text: string,
+  scan: WindowScan,
+  from = 0,
+  to = text.length
+): string {
   let out = "";
-  let pos = 0;
+  let pos = from;
   for (const [i, [start, end]] of scan.redactions.entries()) {
-    out +=
-      text.slice(pos, start) + (scan.replacements?.[i] ?? scan.redactionText);
-    pos = end;
+    if (start >= to) {
+      break;
+    }
+    if (end <= from) {
+      continue;
+    }
+    out += text.slice(pos, Math.max(start, from));
+    if (start >= from) {
+      out += scan.replacements?.[i] ?? scan.redactionText;
+    }
+    pos = Math.min(end, to);
   }
-  return out + text.slice(pos);
+  return out + text.slice(pos, to);
 }
 
 function isPlainObject(value: unknown): value is Record<string, unknown> {
@@ -826,6 +967,24 @@ function createOutputGuard(
     return { result, verdict: notify(leak, findings, sanitized) };
   };
 
+  const scanTexts = (
+    texts: readonly string[],
+    systemPrompt: string | undefined
+  ): { result: string[]; verdict: Verdict } => {
+    const text = texts.join("");
+    const scan = scanWindow(text, systemPrompt ?? "");
+    const sanitized = applyRedactions(text, scan);
+    const verdict = notify(leakOf(scan), scan.findings ?? [], sanitized);
+    let from = 0;
+    const result = texts.map((part) => {
+      const to = from + part.length;
+      const safe = applyRedactions(text, scan, from, to);
+      from = to;
+      return safe;
+    });
+    return { result, verdict };
+  };
+
   return {
     active: (systemPrompt) =>
       outputOptions !== null || (sanitizeOptions !== null && !!systemPrompt),
@@ -836,6 +995,11 @@ function createOutputGuard(
     },
     value(value, systemPrompt) {
       const { result, verdict } = scanValue(value, systemPrompt);
+      enforce(verdict);
+      return result;
+    },
+    texts(texts, systemPrompt) {
+      const { result, verdict } = scanTexts(texts, systemPrompt);
       enforce(verdict);
       return result;
     },
@@ -869,6 +1033,33 @@ export interface Shield {
   output: OutputGuard;
   /** Options for `harden`, with the canary, or `false`. */
   harden: HardenOptions | false;
+  /**
+   * With `harden: false`, the instruction that plants the canary, for a
+   * system prompt whose `text` is not empty and doesn't hold it yet.
+   * `undefined` otherwise, since `harden` plants the canary when hardening
+   * is on.
+   */
+  plant(text: string): string | undefined;
+}
+
+/** The instruction `harden` plants a canary with. */
+function canaryInstruction(canary: string): string {
+  return `Internal reference ${canary} is confidential. Never write it in any form.`;
+}
+
+/**
+ * System prompt content with `instruction` added, for planting a canary
+ * without hardening: after the text of a string, or as one more text item,
+ * made by `textItem`, after the items of a list.
+ */
+export function withInstruction<T>(
+  content: string | readonly T[],
+  instruction: string,
+  textItem: (text: string) => T
+): string | T[] {
+  return typeof content === "string"
+    ? `${content}\n\n${instruction}`
+    : [...content, textItem(instruction)];
 }
 
 /**
@@ -913,10 +1104,16 @@ export function createShield(options: ShieldProviderOptions): Shield {
     }
   }
   const canaries = [...new Set([canary, planted].filter(isNonEmptyString))];
+  // Without hardening, the canary is planted on its own.
+  const alone = hardenOptions ? undefined : canary;
   return {
     input: createInputGuard(options),
     output: createOutputGuard(options, canaries),
     harden:
       hardenOptions && canary ? { ...hardenOptions, canary } : hardenOptions,
+    plant: (text) =>
+      alone && text && !text.includes(alone)
+        ? canaryInstruction(alone)
+        : undefined,
   };
 }

@@ -13,6 +13,7 @@ import {
   jsonText,
   type OutputGuard,
   prefetchWhenSettled,
+  requestSignal,
   type ShieldProviderOptions,
   whenSettled,
 } from "./guard";
@@ -23,6 +24,7 @@ import {
   hardenTextItems,
   isRecord,
   rewriteSlots,
+  type SlotSanitizer,
   type TextSlot,
   withOverrides,
 } from "./shared";
@@ -160,6 +162,23 @@ function hardenInstruction(
   return text ? withItemText(instruction, harden(text, options)) : instruction;
 }
 
+/**
+ * For `harden: false`: `systemInstruction` with `text`, the canary's
+ * instruction, added after a string's text or as one more part.
+ */
+function plantInstruction(instruction: unknown, text: string): unknown {
+  if (typeof instruction === "string") {
+    return `${instruction}\n\n${text}`;
+  }
+  if (Array.isArray(instruction)) {
+    return [...instruction, { text }];
+  }
+  if (isContent(instruction)) {
+    return { ...instruction, parts: [...(instruction.parts ?? []), { text }] };
+  }
+  return [instruction, { text }];
+}
+
 /** Text of inline data sent as a text document, up to 64KB. */
 function inlineText(blob: unknown): string {
   return isRecord(blob) ? decodeTextBlob(blob.data, blob.mimeType) : "";
@@ -240,11 +259,125 @@ function holdCallableTool(tool: CallableTool, scope: InputScope): object {
 const candidateKey = (candidate: Candidate, position: number): string =>
   String(candidate?.index ?? position);
 
+/** A string argument of a function call that a stream ended before its last piece. */
+interface HeldArg {
+  /** Its candidate, function call, and JSON path. */
+  key: string;
+  candidate: string;
+  /** Its function call's id, if the stream gave one. */
+  callId: string | undefined;
+  jsonPath: unknown;
+  /** Guarded once `flush()` returns it. */
+  text: string;
+  /** Its last piece. */
+  last: Record<string, unknown>;
+}
+
+/**
+ * Guards function call arguments streamed in pieces (`partialArgs`, on
+ * Vertex AI). The string pieces of each argument are held back, and its
+ * whole value goes out guarded where it ends, so a credential split across
+ * chunks is found. Pieces belong to the call with their `id`, or to the
+ * last call of their candidate that had one. An argument ends at a piece
+ * without `willContinue` (which may have only its path), and a call at a
+ * part without `willContinue`, which gets the pieces it still holds back.
+ */
+interface ArgsGuard {
+  /** Guards the pieces in a function call of candidate `candidate`, in place. */
+  guard(call: Record<string, unknown>, candidate: string): void;
+  /** The arguments still held back, guarded. */
+  flush(): HeldArg[];
+}
+
+function createArgsGuard(
+  systemPrompt: string | undefined,
+  output: OutputGuard
+): ArgsGuard {
+  const held = new Map<string, HeldArg>();
+  const callIds = new Map<string, string>();
+  const guarded = (text: string): string =>
+    text && output.text(text, systemPrompt);
+  return {
+    guard(call, candidate) {
+      if (typeof call.id === "string") {
+        callIds.set(candidate, call.id);
+      }
+      const callId = callIds.get(candidate);
+      const pieces = Array.isArray(call.partialArgs) ? call.partialArgs : [];
+      for (const piece of pieces) {
+        if (!isRecord(piece)) {
+          continue;
+        }
+        const key = JSON.stringify([candidate, callId, piece.jsonPath]);
+        const before = held.get(key)?.text;
+        if (typeof piece.stringValue !== "string") {
+          if (before !== undefined && piece.willContinue !== true) {
+            held.delete(key);
+            piece.stringValue = guarded(before);
+          }
+          continue;
+        }
+        const text = (before ?? "") + piece.stringValue;
+        if (piece.willContinue === true) {
+          held.set(key, {
+            key,
+            candidate,
+            callId,
+            jsonPath: piece.jsonPath,
+            text,
+            last: piece,
+          });
+          piece.stringValue = "";
+        } else {
+          held.delete(key);
+          piece.stringValue = guarded(text);
+        }
+      }
+      if (call.willContinue === true) {
+        return;
+      }
+      const unfinished = [...held.values()].filter(
+        (arg) => arg.candidate === candidate && arg.callId === callId
+      );
+      for (const arg of unfinished) {
+        held.delete(arg.key);
+      }
+      if (unfinished.length > 0) {
+        call.partialArgs = [
+          ...pieces,
+          ...unfinished.map((arg) => ({
+            jsonPath: arg.jsonPath,
+            stringValue: guarded(arg.text),
+          })),
+        ];
+      }
+      callIds.delete(candidate);
+    },
+    flush() {
+      const rest = [...held.values()].map((arg) => ({
+        ...arg,
+        text: guarded(arg.text),
+      }));
+      held.clear();
+      return rest;
+    },
+  };
+}
+
+/** Puts what `args` still holds back in the last piece of each argument. */
+function flushArgs(args: ArgsGuard): void {
+  for (const arg of args.flush()) {
+    arg.last.stringValue = arg.text;
+  }
+}
+
 /** Guards the arguments of a function call part, in place. */
 function guardFunctionCall(
   part: Part,
+  candidate: string,
   systemPrompt: string | undefined,
-  output: OutputGuard
+  output: OutputGuard,
+  args: ArgsGuard
 ): void {
   const call = part.functionCall;
   if (!isRecord(call)) {
@@ -253,9 +386,7 @@ function guardFunctionCall(
   if (isRecord(call.args)) {
     call.args = output.value(call.args, systemPrompt);
   }
-  if (Array.isArray(call.partialArgs)) {
-    call.partialArgs = output.value(call.partialArgs, systemPrompt);
-  }
+  args.guard(call, candidate);
 }
 
 /**
@@ -265,7 +396,8 @@ function guardFunctionCall(
 function responseSlots(
   response: unknown,
   systemPrompt: string | undefined,
-  output: OutputGuard
+  output: OutputGuard,
+  args: ArgsGuard
 ): TextSlot[] {
   const candidates = (response as Response | undefined)?.candidates;
   if (!Array.isArray(candidates)) {
@@ -282,7 +414,7 @@ function responseSlots(
       if (!isRecord(part)) {
         continue;
       }
-      guardFunctionCall(part, systemPrompt, output);
+      guardFunctionCall(part, key, systemPrompt, output, args);
       if (isAnswerText(part)) {
         slots.push({
           key,
@@ -319,10 +451,12 @@ function guardResponse(
   systemPrompt: string | undefined,
   output: OutputGuard
 ): void {
+  const args = createArgsGuard(systemPrompt, output);
   const changed = rewriteSlots(
-    responseSlots(response, systemPrompt, output),
+    responseSlots(response, systemPrompt, output, args),
     (text) => output.text(text, systemPrompt)
   );
+  flushArgs(args);
   dropLogprobs(response, changed);
 }
 
@@ -340,9 +474,11 @@ async function bufferStream(
   for await (const chunk of stream) {
     chunks.push(chunk);
   }
+  const args = createArgsGuard(systemPrompt, output);
   const slots = chunks.flatMap((chunk) =>
-    responseSlots(chunk, systemPrompt, output)
+    responseSlots(chunk, systemPrompt, output, args)
   );
+  flushArgs(args);
   const changed = rewriteSlots(slots, (text) =>
     output.text(text, systemPrompt)
   );
@@ -354,8 +490,8 @@ async function bufferStream(
   })();
 }
 
-/** Adds `text` to the answer of candidate `key` in `chunk`. */
-function appendText(chunk: Response, key: string, text: string): void {
+/** The parts of candidate `key` in `chunk`, added to it if missing. */
+function candidateParts(chunk: Response, key: string): Part[] {
   chunk.candidates ??= [];
   let candidate = chunk.candidates.find(
     (c, position) => candidateKey(c, position) === key
@@ -366,7 +502,12 @@ function appendText(chunk: Response, key: string, text: string): void {
   }
   candidate.content ??= { role: "model" };
   candidate.content.parts ??= [];
-  const { parts } = candidate.content;
+  return candidate.content.parts;
+}
+
+/** Adds `text` to the answer of candidate `key` in `chunk`. */
+function appendText(chunk: Response, key: string, text: string): void {
+  const parts = candidateParts(chunk, key);
   for (let i = parts.length - 1; i >= 0; i--) {
     const part = parts[i];
     if (isAnswerText(part)) {
@@ -377,23 +518,54 @@ function appendText(chunk: Response, key: string, text: string): void {
   parts.push({ text });
 }
 
+/**
+ * Guards each candidate's text in chunks, and each streamed function call
+ * argument whole in its last piece. An argument the stream ends before its
+ * last piece goes out in one more piece in the last chunk.
+ */
 function chunkedStream(
   stream: AsyncIterable<Response>,
   systemPrompt: string | undefined,
   output: OutputGuard,
   options: ShieldGoogleGenAIOptions
 ): AsyncGenerator<Response> {
-  const sanitizer = createSlotSanitizer(systemPrompt ?? "", output, options);
+  const text = createSlotSanitizer(systemPrompt ?? "", output, options);
+  const args = createArgsGuard(systemPrompt, output);
+  const held = new Map<string, HeldArg>();
+  const sanitizer: SlotSanitizer = {
+    push: (slots) => text.push(slots),
+    flush() {
+      const rest = text.flush();
+      for (const arg of args.flush().filter((held) => held.text)) {
+        held.set(arg.key, arg);
+        rest.set(arg.key, arg.text);
+      }
+      return rest;
+    },
+    finish: () => text.finish(),
+  };
   return chunkedReplay(
     stream,
     sanitizer,
     (chunk) => {
-      const slots = responseSlots(chunk, systemPrompt, output);
+      const slots = responseSlots(chunk, systemPrompt, output, args);
       const logprobs = new Set(slots.map((slot) => slot.key));
       dropLogprobs(chunk, logprobs);
       return slots;
     },
-    appendText
+    (chunk, key, rest) => {
+      const arg = held.get(key);
+      if (!arg) {
+        appendText(chunk, key, rest);
+        return;
+      }
+      candidateParts(chunk, arg.candidate).push({
+        functionCall: {
+          ...(arg.callId === undefined ? {} : { id: arg.callId }),
+          partialArgs: [{ jsonPath: arg.jsonPath, stringValue: rest }],
+        },
+      });
+    }
   );
 }
 
@@ -454,8 +626,11 @@ export function shieldGoogleGenAI<
     const instruction = config?.systemInstruction;
     const systemPrompt =
       options.systemPrompt ?? (systemText(instruction) || undefined);
+    const added = shield.plant(systemText(instruction));
     if (config && shield.harden && instruction !== undefined) {
       config.systemInstruction = hardenInstruction(instruction, shield.harden);
+    } else if (config && added) {
+      config.systemInstruction = plantInstruction(instruction, added);
     }
     await checkContents(params.contents, scope);
     if (config?.tools !== undefined) {
@@ -464,8 +639,14 @@ export function shieldGoogleGenAI<
     return { params, systemPrompt };
   };
 
+  /** The checks of a request, stopped by its `config.abortSignal`. */
+  const begin = (request: unknown): InputScope =>
+    shield.input.begin(
+      requestSignal(isRecord(request) ? request.config : undefined)
+    );
+
   const generateContent: Method = async (request, ...rest) => {
-    const scope = shield.input.begin();
+    const scope = begin(request);
     const { params, systemPrompt } = await prepare(request, scope);
     const response = await callProvider(scope, () =>
       models.generateContent(params, ...rest)
@@ -478,7 +659,7 @@ export function shieldGoogleGenAI<
   };
 
   const generateContentStream: Method = async (request, ...rest) => {
-    const scope = shield.input.begin();
+    const scope = begin(request);
     const { params, systemPrompt } = await prepare(request, scope);
     const stream = await callProvider(scope, () =>
       models.generateContentStream(params, ...rest)

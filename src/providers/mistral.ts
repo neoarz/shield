@@ -10,8 +10,11 @@ import {
   endWhenSettled,
   type InputScope,
   type OutputGuard,
+  requestSignal,
+  type Shield,
   type ShieldProviderOptions,
   whenSettled,
+  withInstruction,
 } from "./guard";
 import {
   chunkedReplay,
@@ -19,6 +22,7 @@ import {
   hardenTextItems,
   isRecord,
   rewriteSlots,
+  type SlotSanitizer,
   streamLike,
   type TextSlot,
   withOverrides,
@@ -110,13 +114,31 @@ function hardenContent(
   );
 }
 
-function hardenSystemMessages(
-  messages: Message[],
-  options: HardenOptions
-): void {
+/** The text of every system message, joined. */
+function systemText(messages: Message[]): string {
+  return messages
+    .filter((message) => message?.role === "system")
+    .map((message) => contentText(message.content))
+    .filter(Boolean)
+    .join("\n");
+}
+
+/** Hardens each system message, or with `harden: false`, plants the canary. */
+function hardenSystemMessages(messages: Message[], shield: Shield): void {
   for (const message of messages) {
-    if (message?.role === "system") {
-      message.content = hardenContent(message.content, options);
+    if (message?.role !== "system") {
+      continue;
+    }
+    if (shield.harden) {
+      message.content = hardenContent(message.content, shield.harden);
+      continue;
+    }
+    const instruction = shield.plant(contentText(message.content));
+    if (instruction && message.content) {
+      message.content = withInstruction(message.content, instruction, (t) => ({
+        type: "text",
+        text: t,
+      }));
     }
   }
 }
@@ -291,9 +313,20 @@ function appendText(event: CompletionEvent, key: string, text: string): void {
   }
 }
 
+/** The keys of the choices `event` finishes. */
+function finishedChoices(event: CompletionEvent): string[] {
+  return (event?.data?.choices ?? []).flatMap((choice, position) =>
+    choice?.finishReason ? [choiceKey(choice, position)] : []
+  );
+}
+
 /**
  * Guards each choice's text in chunks. Tool call arguments, which Mistral
- * sends whole in one delta, are guarded delta by delta.
+ * usually sends whole in one delta, are guarded whole: arguments split over
+ * several deltas are joined into the last of them when the choice finishes
+ * or the stream ends. Mistral doesn't mark the end of one call, and deltas
+ * of other calls can come between its pieces, so events are held back
+ * while a call is open.
  */
 function chunkedStream(
   stream: AsyncIterable<CompletionEvent>,
@@ -301,19 +334,47 @@ function chunkedStream(
   output: OutputGuard,
   options: ShieldMistralOptions
 ): AsyncGenerator<CompletionEvent> {
-  const sanitizer = createSlotSanitizer(systemPrompt ?? "", output, options);
-  const guard = (text: string): string => output.text(text, systemPrompt);
+  const text = createSlotSanitizer(systemPrompt ?? "", output, options);
+  /** Each open tool call's arguments so far, and the slot of its last delta. */
+  const calls = new Map<string, { args: string; slot: TextSlot }>();
+  const settle = (key: string): void => {
+    const call = calls.get(key);
+    if (call) {
+      calls.delete(key);
+      call.slot.set(call.args && output.text(call.args, systemPrompt));
+    }
+  };
+  const sanitizer: SlotSanitizer = {
+    push: (slots) => text.push(slots),
+    flush() {
+      for (const key of [...calls.keys()]) {
+        settle(key);
+      }
+      return text.flush();
+    },
+    finish: () => text.finish(),
+  };
   return chunkedReplay(
     stream,
     sanitizer,
     (event) => {
-      const { text, args } = eventSlots(event, systemPrompt, output);
-      for (const slot of args) {
-        rewriteSlots([slot], guard);
+      const slots = eventSlots(event, systemPrompt, output);
+      for (const slot of slots.args) {
+        const call = calls.get(slot.key);
+        call?.slot.set("");
+        calls.set(slot.key, { args: (call?.args ?? "") + slot.text, slot });
       }
-      return text;
+      for (const choice of finishedChoices(event)) {
+        for (const key of [...calls.keys()]) {
+          if (key.startsWith(`${choice}:tool:`)) {
+            settle(key);
+          }
+        }
+      }
+      return slots.text;
     },
-    appendText
+    appendText,
+    () => calls.size > 0
   );
 }
 
@@ -344,21 +405,29 @@ export function shieldMistral<
     const params: Request = messages
       ? { ...original, messages }
       : { ...original };
-    const system = messages?.find((m) => m?.role === "system");
     const systemPrompt =
       options.systemPrompt ??
-      ((system && contentText(system.content)) || undefined);
+      ((messages && systemText(messages)) || undefined);
     if (messages) {
-      if (shield.harden) {
-        hardenSystemMessages(messages, shield.harden);
-      }
+      hardenSystemMessages(messages, shield);
       await checkMessages(messages, scope);
     }
     return { params, systemPrompt };
   };
 
+  /**
+   * The checks of a request, stopped by the signal in its request options,
+   * given there or in their `fetchOptions`.
+   */
+  const begin = (requestOptions: unknown): InputScope =>
+    shield.input.begin(
+      requestSignal(
+        isRecord(requestOptions) ? requestOptions.fetchOptions : undefined
+      ) ?? requestSignal(requestOptions)
+    );
+
   const complete: Method = async (request, ...rest) => {
-    const scope = shield.input.begin();
+    const scope = begin(rest[0]);
     const { params, systemPrompt } = await prepare(request, scope);
     const response = await callProvider(scope, () =>
       chat.complete(params, ...rest)
@@ -371,7 +440,7 @@ export function shieldMistral<
   };
 
   const stream: Method = async (request, ...rest) => {
-    const scope = shield.input.begin();
+    const scope = begin(rest[0]);
     const { params, systemPrompt } = await prepare(request, scope);
     const events = await callProvider(scope, () =>
       chat.stream(params, ...rest)

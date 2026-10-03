@@ -1,20 +1,24 @@
 /**
  * A focused JSON Schema validator for tool call arguments. It knows `type`
  * (with OpenAPI's `nullable`), `required`, `properties`,
- * `additionalProperties`, `items`, `minItems`, `maxItems`, `enum`, `const`,
- * `minLength`, `maxLength`, `pattern`, `minimum`, `maximum`,
- * `exclusiveMinimum`, `exclusiveMaximum`, `anyOf`, `oneOf`, `allOf`, `not`,
- * and `$ref` to a JSON pointer in the same schema, such as `#/$defs/name`.
- * Every other keyword is ignored.
+ * `patternProperties`, `additionalProperties`, `propertyNames`,
+ * `minProperties`, `maxProperties`, `dependentRequired`,
+ * `dependentSchemas`, `dependencies`, `prefixItems`, `items`,
+ * `additionalItems`, `minItems`, `maxItems`, `uniqueItems`, `enum`,
+ * `const`, `minLength`, `maxLength`, `pattern`, `minimum`, `maximum`,
+ * `exclusiveMinimum`, `exclusiveMaximum`, `multipleOf`, `anyOf`, `oneOf`,
+ * `allOf`, `not`, `if`, `then`, `else`, and `$ref` to a JSON pointer in the
+ * same schema, such as `#/$defs/name`. Every other keyword, such as
+ * `unevaluatedProperties` or `format`, is ignored.
  *
  * Schemas can come from an MCP server, so validation is bounded: `$ref` is
- * followed at most 32 deep, arguments are read at most 64 levels deep, one
- * validation takes at most 100,000 steps, and patterns are run as
- * `planPattern()` allows. Violations say where and which keyword, never the
- * value.
+ * followed at most 32 deep, arguments are read at most 64 levels deep,
+ * schemas inside schemas at most 512, one validation takes at most 100,000
+ * steps, and patterns are run as `planPattern()` allows. Violations say
+ * where and which keyword, never the value.
  */
 
-import { PATTERN_WORK, planPattern } from "./pattern";
+import { PATTERN_WORK, type PatternPlan, planPattern } from "./pattern";
 
 export interface SchemaViolation {
   /**
@@ -31,6 +35,8 @@ export interface SchemaViolation {
 
 const MAX_STEPS = 100_000;
 const MAX_DEPTH = 64;
+/** How many schemas one check may be inside: properties, items, `$ref`, and combinators all count. */
+const MAX_NESTING = 512;
 const MAX_REF_DEPTH = 32;
 const MAX_KEY_IN_PATH = 64;
 /** Pattern work, as length ** degree, that counts as one step. */
@@ -44,10 +50,13 @@ type JsonRecord = Record<string, unknown>;
 
 interface Run {
   root: unknown;
-  budget: { steps: number; exhausted: boolean };
+  /** Shared by every quiet run of one validation. `nesting` counts the schemas the check is inside now. */
+  budget: { steps: number; exhausted: boolean; nesting: number };
   /** Violations found so far, or `null` in a quiet run, which only needs to know whether the value is valid. */
   out: SchemaViolation[] | null;
   max: number;
+  /** Each schema's `patternProperties` as entries, read once per validation. */
+  patterns: WeakMap<JsonRecord, [string, unknown][]>;
 }
 
 function asRecord(value: unknown): JsonRecord | undefined {
@@ -72,9 +81,9 @@ function propertyPath(path: string, key: string): string {
     : `${path}[${JSON.stringify(shown)}]`;
 }
 
-/** Stops collecting once `max` violations were found. */
+/** Whether to stop: `max` violations were found, or the budget is spent. */
 function full(run: Run): boolean {
-  return run.out === null || run.out.length >= run.max;
+  return run.out === null || run.budget.exhausted || run.out.length >= run.max;
 }
 
 function report(
@@ -115,6 +124,55 @@ function codePoints(text: string): number {
     count += 1;
   }
   return count;
+}
+
+/**
+ * A string that JSON-equal values share, with object keys sorted, or
+ * `undefined` for a value nested deeper than `MAX_DEPTH`.
+ */
+function jsonKey(value: unknown, depth = 0): string | undefined {
+  if (value === null || typeof value !== "object") {
+    return JSON.stringify(value) ?? "undefined";
+  }
+  if (depth > MAX_DEPTH) {
+    return;
+  }
+  const parts: string[] = [];
+  if (Array.isArray(value)) {
+    for (const item of value) {
+      const key = jsonKey(item, depth + 1);
+      if (key === undefined) {
+        return;
+      }
+      parts.push(key);
+    }
+    return `[${parts.join(",")}]`;
+  }
+  const record = value as JsonRecord;
+  for (const name of Object.keys(record).sort()) {
+    const key = jsonKey(record[name], depth + 1);
+    if (key === undefined) {
+      return;
+    }
+    parts.push(`${JSON.stringify(name)}:${key}`);
+  }
+  return `{${parts.join(",")}}`;
+}
+
+/** Whether no two of `items` are equal, or `undefined` when one is nested too deep to compare. */
+function allDifferent(items: unknown[]): boolean | undefined {
+  const keys = new Set<string>();
+  for (const item of items) {
+    const key = jsonKey(item);
+    if (key === undefined) {
+      return;
+    }
+    if (keys.has(key)) {
+      return false;
+    }
+    keys.add(key);
+  }
+  return true;
 }
 
 function jsonEqual(a: unknown, b: unknown, depth = 0): boolean {
@@ -257,6 +315,15 @@ function checkString(
   return valid;
 }
 
+/** Runs a planned pattern on `value`, no longer than its `maxLength`, counting the work against the budget. */
+function runPattern(run: Run, plan: PatternPlan, value: string): boolean {
+  const work = Math.min(value.length ** Math.max(plan.degree, 1), PATTERN_WORK);
+  if (spend(run, Math.ceil(work / PATTERN_WORK_PER_STEP))) {
+    return false;
+  }
+  return plan.regex.test(value);
+}
+
 function checkPattern(
   run: Run,
   pattern: string,
@@ -276,11 +343,7 @@ function checkPattern(
     );
     return false;
   }
-  const work = Math.min(value.length ** Math.max(plan.degree, 1), PATTERN_WORK);
-  if (spend(run, Math.ceil(work / PATTERN_WORK_PER_STEP))) {
-    return false;
-  }
-  if (plan.regex.test(value)) {
+  if (runPattern(run, plan, value)) {
     return true;
   }
   report(run, path, "pattern", "must match the pattern");
@@ -319,6 +382,22 @@ function aboveMaximum(schema: JsonRecord, value: number): [string, string][] {
   return out;
 }
 
+/**
+ * Whether `value` is a multiple of `divisor`: exactly for integers, and
+ * within rounding error otherwise, so 0.3 is a multiple of 0.1.
+ */
+function isMultiple(value: number, divisor: number): boolean {
+  if (Number.isInteger(value) && Number.isInteger(divisor)) {
+    return value % divisor === 0;
+  }
+  const quotient = value / divisor;
+  const error = Math.abs(quotient - Math.round(quotient));
+  return (
+    Number.isFinite(quotient) &&
+    error <= 4 * Number.EPSILON * Math.max(1, Math.abs(quotient))
+  );
+}
+
 function checkNumber(
   run: Run,
   schema: JsonRecord,
@@ -329,10 +408,36 @@ function checkNumber(
     ...belowMinimum(schema, value),
     ...aboveMaximum(schema, value),
   ];
+  const { multipleOf } = schema;
+  if (
+    isNumber(multipleOf) &&
+    multipleOf > 0 &&
+    !isMultiple(value, multipleOf)
+  ) {
+    failed.push(["multipleOf", `must be a multiple of ${multipleOf}`]);
+  }
   for (const [keyword, message] of failed) {
     report(run, path, keyword, message);
   }
   return failed.length === 0;
+}
+
+/**
+ * The schemas of an array's first items, from `prefixItems` or an `items`
+ * array, and of the items after them, from `items` or `additionalItems`.
+ */
+function itemSchemas(schema: JsonRecord): { tuple: unknown[]; rest: unknown } {
+  const { prefixItems, items, additionalItems } = schema;
+  if (Array.isArray(prefixItems)) {
+    return {
+      tuple: prefixItems,
+      rest: Array.isArray(items) ? undefined : items,
+    };
+  }
+  if (Array.isArray(items)) {
+    return { tuple: items, rest: additionalItems };
+  }
+  return { tuple: [], rest: items };
 }
 
 function checkArray(
@@ -357,12 +462,24 @@ function checkArray(
     valid = false;
     report(run, path, "maxItems", `must have at most ${schema.maxItems} items`);
   }
-  const { items } = schema;
-  if (items === undefined) {
-    return valid;
+  if (schema.uniqueItems === true) {
+    spend(run, value.length);
+    const unique = allDifferent(value);
+    if (unique !== true) {
+      valid = false;
+      report(
+        run,
+        path,
+        "uniqueItems",
+        unique === false
+          ? "must not have equal items"
+          : "has items nested too deep to compare"
+      );
+    }
   }
+  const { tuple, rest } = itemSchemas(schema);
   for (const [i, item] of value.entries()) {
-    const itemSchema = Array.isArray(items) ? items[i] : items;
+    const itemSchema = i < tuple.length ? tuple[i] : rest;
     if (itemSchema === undefined) {
       break;
     }
@@ -395,35 +512,164 @@ function checkRequired(
   return valid;
 }
 
-/** Checks one property against `properties` or `additionalProperties`. */
+/**
+ * Whether `key` matches `pattern`: `false` for a pattern that isn't run,
+ * and `undefined` for a key too long to run it on.
+ */
+function keyMatches(
+  run: Run,
+  pattern: string,
+  key: string
+): boolean | undefined {
+  const plan = planPattern(pattern);
+  if (!plan) {
+    return false;
+  }
+  if (key.length > plan.maxLength) {
+    return;
+  }
+  return runPattern(run, plan, key);
+}
+
+/**
+ * Checks one property against `properties` and every `patternProperties`
+ * pattern its key matches, or against `additionalProperties` when there is
+ * none. Only a key `properties` declares is shown in paths.
+ */
 function checkProperty(
   run: Run,
   schema: JsonRecord,
   value: JsonRecord,
   key: string,
+  patterns: [string, unknown][],
   path: string,
   depth: number,
   refs: number
 ): boolean {
   const properties = asRecord(schema.properties) ?? {};
-  if (hasOwn(properties, key)) {
-    const at = propertyPath(path, key);
-    return check(run, properties[key], value[key], at, depth + 1, refs);
+  let named = hasOwn(properties, key);
+  const at = named ? propertyPath(path, key) : `${path}.*`;
+  let valid = named
+    ? check(run, properties[key], value[key], at, depth + 1, refs)
+    : true;
+  for (const [pattern, patternSchema] of patterns) {
+    if (spend(run)) {
+      return false;
+    }
+    const match = keyMatches(run, pattern, key);
+    if (match === undefined) {
+      report(
+        run,
+        `${path}.*`,
+        "patternProperties",
+        "has a key too long to check against its patterns"
+      );
+      return false;
+    }
+    if (match) {
+      named = true;
+      valid =
+        check(run, patternSchema, value[key], at, depth + 1, refs) && valid;
+    }
   }
-  // Without patternProperties, which this validator doesn't read, it can't
-  // tell which keys are additional.
-  const additional =
-    schema.patternProperties === undefined
-      ? schema.additionalProperties
-      : undefined;
+  if (named) {
+    return valid;
+  }
+  const additional = schema.additionalProperties;
   if (additional === false) {
-    report(run, `${path}.*`, "additionalProperties", "is not allowed");
+    report(run, at, "additionalProperties", "is not allowed");
     return false;
   }
   if (additional === undefined || additional === true) {
     return true;
   }
-  return check(run, additional, value[key], `${path}.*`, depth + 1, refs);
+  return check(run, additional, value[key], at, depth + 1, refs);
+}
+
+function patternEntries(run: Run, schema: JsonRecord): [string, unknown][] {
+  let entries = run.patterns.get(schema);
+  if (!entries) {
+    entries = Object.entries(asRecord(schema.patternProperties) ?? {});
+    run.patterns.set(schema, entries);
+  }
+  return entries;
+}
+
+function checkPropertyCount(
+  run: Run,
+  schema: JsonRecord,
+  keys: string[],
+  path: string
+): boolean {
+  let valid = true;
+  if (isNumber(schema.minProperties) && keys.length < schema.minProperties) {
+    valid = false;
+    report(
+      run,
+      path,
+      "minProperties",
+      `must have at least ${schema.minProperties} properties`
+    );
+  }
+  if (isNumber(schema.maxProperties) && keys.length > schema.maxProperties) {
+    valid = false;
+    report(
+      run,
+      path,
+      "maxProperties",
+      `must have at most ${schema.maxProperties} properties`
+    );
+  }
+  return valid;
+}
+
+const DEPENDENCY_KEYWORDS = [
+  "dependentRequired",
+  "dependentSchemas",
+  "dependencies",
+] as const;
+
+/**
+ * Checks `dependentRequired`, `dependentSchemas`, and `dependencies`, which
+ * holds either: what else the object must have once it has a property.
+ */
+function checkDependencies(
+  run: Run,
+  schema: JsonRecord,
+  value: JsonRecord,
+  keys: string[],
+  path: string,
+  depth: number,
+  refs: number
+): boolean {
+  let valid = true;
+  const present = new Set(keys);
+  for (const keyword of DEPENDENCY_KEYWORDS) {
+    const dependencies = asRecord(schema[keyword]) ?? {};
+    for (const key of keys) {
+      if (!hasOwn(dependencies, key)) {
+        continue;
+      }
+      const dependency = dependencies[key];
+      if (Array.isArray(dependency)) {
+        if (spend(run, dependency.length)) {
+          return false;
+        }
+        for (const name of dependency) {
+          if (typeof name === "string" && !present.has(name)) {
+            valid = false;
+            report(run, propertyPath(path, name), keyword, "is required");
+          }
+        }
+      } else if (keyword !== "dependentRequired") {
+        valid = check(run, dependency, value, path, depth, refs) && valid;
+      }
+      if (full(run) && !valid) {
+        return false;
+      }
+    }
+  }
+  return valid;
 }
 
 function checkObject(
@@ -434,17 +680,33 @@ function checkObject(
   depth: number,
   refs: number
 ): boolean {
+  const keys = Object.keys(value).filter((key) => value[key] !== undefined);
+  const patterns = patternEntries(run, schema);
   let valid = checkRequired(run, schema, value, path);
-  for (const key of Object.keys(value)) {
-    if (value[key] === undefined) {
-      continue;
+  valid = checkPropertyCount(run, schema, keys, path) && valid;
+  for (const key of keys) {
+    valid =
+      checkProperty(run, schema, value, key, patterns, path, depth, refs) &&
+      valid;
+    if (
+      schema.propertyNames !== undefined &&
+      !matches(run, schema.propertyNames, key, depth + 1, refs)
+    ) {
+      valid = false;
+      report(
+        run,
+        `${path}.*`,
+        "propertyNames",
+        "has a key that doesn't match propertyNames"
+      );
     }
-    valid = checkProperty(run, schema, value, key, path, depth, refs) && valid;
     if (full(run) && !valid) {
       return false;
     }
   }
-  return valid;
+  return (
+    checkDependencies(run, schema, value, keys, path, depth, refs) && valid
+  );
 }
 
 /** Runs `check` without reporting, sharing the budget. */
@@ -534,6 +796,14 @@ function checkCombinators(
     valid = false;
     report(run, path, "not", "matches a schema it must not match");
   }
+  if (schema.if !== undefined) {
+    const branch = matches(run, schema.if, value, depth, refs)
+      ? schema.then
+      : schema.else;
+    if (branch !== undefined) {
+      valid = check(run, branch, value, path, depth, refs) && valid;
+    }
+  }
   return valid;
 }
 
@@ -598,6 +868,24 @@ function check(
     report(run, path, "depth", `is nested deeper than ${MAX_DEPTH} levels`);
     return false;
   }
+  if (run.budget.nesting >= MAX_NESTING) {
+    run.budget.exhausted = true;
+    return false;
+  }
+  run.budget.nesting += 1;
+  const valid = checkRecord(run, record, value, path, depth, refs);
+  run.budget.nesting -= 1;
+  return valid;
+}
+
+function checkRecord(
+  run: Run,
+  record: JsonRecord,
+  value: unknown,
+  path: string,
+  depth: number,
+  refs: number
+): boolean {
   let valid = true;
   if (typeof record.$ref === "string") {
     if (refs >= MAX_REF_DEPTH) {
@@ -621,8 +909,9 @@ function check(
 
 /**
  * Validates `value` against a JSON schema and returns up to `max`
- * violations, none when it is valid. When validation runs out of steps, the
- * only violation is `{ path: "$", keyword: "budget" }`.
+ * violations, none when it is valid. When validation runs out of steps, or
+ * finds schemas nested more than 512 deep, the only violation is
+ * `{ path: "$", keyword: "budget" }`.
  */
 export function validateSchema(
   schema: unknown,
@@ -631,9 +920,10 @@ export function validateSchema(
 ): SchemaViolation[] {
   const run: Run = {
     root: schema,
-    budget: { steps: 0, exhausted: false },
+    budget: { steps: 0, exhausted: false, nesting: 0 },
     out: [],
     max,
+    patterns: new WeakMap(),
   };
   const valid = check(run, schema, value, "$", 0, 0);
   if (run.budget.exhausted) {

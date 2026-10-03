@@ -149,6 +149,31 @@ describe("declared tools", () => {
     expect(policy.check({ name: "other" }).reason).toBe("undeclared_tool");
   });
 
+  it("checks a Zod 4 tuple's items, and allows a valid one", () => {
+    const policy = createToolPolicy({
+      tools: {
+        move: {
+          inputSchema: z.object({ point: z.tuple([z.number(), z.number()]) }),
+        },
+      },
+    });
+    const move = (point: unknown) =>
+      policy.check({ name: "move", arguments: { point } });
+
+    expect(move([1, 2]).allowed).toBe(true);
+    expect(move([1, "x"]).violations).toEqual([
+      { path: "$.point[1]", keyword: "type", message: "must be number" },
+    ]);
+    expect(move([1, 2, 3]).violations).toEqual([
+      {
+        path: "$.point",
+        keyword: "maxItems",
+        message: "must have at most 2 items",
+      },
+      { path: "$.point[2]", keyword: "false", message: "is not allowed" },
+    ]);
+  });
+
   it("keeps each source's tools, and replaces them when the source declares again", () => {
     const policy = createToolPolicy({ tools: [READ_INBOX] });
     policy.declareTools([SEND_EMAIL], "mail");
@@ -670,8 +695,43 @@ describe("validateSchema", () => {
     [{ oneOf: [{ minimum: 1 }, { maximum: 5 }] }, 7, true],
     [{ allOf: [{ minimum: 1 }, { maximum: 5 }] }, 7, false],
     [{ not: { type: "string" } }, "a", false],
-    [{ format: "email", multipleOf: 3, unknownKeyword: {} }, 4, true],
+    [{ format: "email", unknownKeyword: {} }, 4, true],
     [{ minimum: 1 }, "not a number", true],
+    [{ multipleOf: 5 }, 10, true],
+    [{ multipleOf: 5 }, 7, false],
+    [{ multipleOf: 0.1 }, 0.3, true],
+    [{ multipleOf: 0.01 }, 1.234, false],
+    [{ minProperties: 1 }, { a: 1 }, true],
+    [{ minProperties: 1 }, {}, false],
+    [{ maxProperties: 1 }, { a: 1 }, true],
+    [{ maxProperties: 1 }, { a: 1, b: 2 }, false],
+    [{ uniqueItems: true }, [1, "1", [1], { a: 1 }, { a: 2 }], true],
+    [{ uniqueItems: true }, [1, 1], false],
+    [{ uniqueItems: true }, [{ a: 1, b: 2 }, { b: 2, a: 1 }], false],
+    [{ propertyNames: { pattern: "^[a-z]+$" } }, { abc: 1 }, true],
+    [{ propertyNames: { pattern: "^[a-z]+$" } }, { "BAD-KEY": 1 }, false],
+    [{ propertyNames: { maxLength: 3 } }, { abcd: 1 }, false],
+    [{ prefixItems: [{ type: "string" }, { type: "number" }] }, ["a", 1], true],
+    [{ prefixItems: [{ type: "string" }, { type: "number" }] }, [1, "x"], false],
+    [{ prefixItems: [{ type: "number" }] }, [1, "a"], true],
+    [{ prefixItems: [{ type: "number" }], items: false }, [1], true],
+    [{ prefixItems: [{ type: "number" }], items: false }, [1, 2], false],
+    [{ prefixItems: [true], items: { type: "string" } }, [1, "a"], true],
+    [{ prefixItems: [true], items: { type: "string" } }, [1, 2], false],
+    [{ items: [{ type: "string" }], additionalItems: false }, ["a"], true],
+    [{ items: [{ type: "string" }], additionalItems: false }, ["a", 1], false],
+    [{ dependentRequired: { a: ["b"] } }, { a: 1, b: 2 }, true],
+    [{ dependentRequired: { a: ["b"] } }, { b: 2 }, true],
+    [{ dependentRequired: { a: ["b"] } }, { a: 1 }, false],
+    [{ dependentSchemas: { a: { required: ["b"] } } }, { a: 1, b: 2 }, true],
+    [{ dependentSchemas: { a: { required: ["b"] } } }, { a: 1 }, false],
+    [
+      { dependencies: { a: ["b"], c: { required: ["d"] } } },
+      { a: 1, b: 1, c: 1, d: 1 },
+      true,
+    ],
+    [{ dependencies: { a: ["b"] } }, { a: 1 }, false],
+    [{ dependencies: { c: { required: ["d"] } } }, { c: 1 }, false],
   ])("%j with %j: valid %s", (schema, value, valid) => {
     expect(validateSchema(schema, value).length === 0).toBe(valid);
   });
@@ -694,13 +754,151 @@ describe("validateSchema", () => {
     ]);
   });
 
-  it("does not decide which keys are additional when patternProperties is present", () => {
+  it("checks patternProperties, and additionalProperties against the keys neither names", () => {
     const schema = {
       type: "object",
+      properties: { to: { type: "string" }, "x-id": { minLength: 2 } },
       patternProperties: { "^x-": { type: "string" } },
       additionalProperties: false,
     };
-    expect(validateSchema(schema, { "x-a": "1", b: 2 })).toEqual([]);
+
+    expect(
+      validateSchema(schema, { to: "a", "x-a": "1", "x-id": "ab" })
+    ).toEqual([]);
+    expect(validateSchema(schema, { to: "a", bcc: "b" })).toEqual([
+      {
+        path: "$.*",
+        keyword: "additionalProperties",
+        message: "is not allowed",
+      },
+    ]);
+    expect(validateSchema(schema, { "x-a": 1, "x-id": 7 })).toEqual([
+      { path: "$.*", keyword: "type", message: "must be string" },
+      { path: '$["x-id"]', keyword: "type", message: "must be string" },
+    ]);
+  });
+
+  it("writes a key only a pattern matches as *, since it comes from the arguments", () => {
+    expect(
+      validateSchema(
+        { patternProperties: { ".*": { type: "number" } } },
+        { [TOKEN]: "wrong" }
+      )
+    ).toEqual([{ path: "$.*", keyword: "type", message: "must be number" }]);
+  });
+
+  it("fails a key it can't check against patternProperties", () => {
+    const unsafe = { patternProperties: { "(a+)+$": {} } };
+    const twoQuantifiers = { patternProperties: { "^a+b+$": {} } };
+
+    expect(validateSchema(unsafe, { aa: 1 })).toEqual([]);
+    expect(
+      validateSchema({ ...unsafe, additionalProperties: false }, { aa: 1 })
+    ).toEqual([
+      {
+        path: "$.*",
+        keyword: "additionalProperties",
+        message: "is not allowed",
+      },
+    ]);
+    expect(
+      validateSchema(twoQuantifiers, { [`${"a".repeat(2000)}b`]: 1 })
+    ).toEqual([
+      {
+        path: "$.*",
+        keyword: "patternProperties",
+        message: "has a key too long to check against its patterns",
+      },
+    ]);
+  });
+
+  it("counts patternProperties and dependencies against its step budget", () => {
+    const names = Array.from({ length: 2000 }, (_, i) => `k${i}`);
+    const value = Object.fromEntries(names.map((k) => [k, 1]));
+    const patterns = Object.fromEntries(names.map((k) => [`(${k}+)+`, {}]));
+    const required = Object.fromEntries(
+      names.slice(0, 100).map((k) => [k, names])
+    );
+    const budget = [
+      { path: "$", keyword: "budget", message: "is too complex to validate" },
+    ];
+
+    expect(validateSchema({ patternProperties: patterns }, value)).toEqual(
+      budget
+    );
+    expect(validateSchema({ dependentRequired: required }, value)).toEqual(
+      budget
+    );
+  });
+
+  it("reads patternProperties once, not for every object", () => {
+    const names = Array.from({ length: 16_000 }, (_, i) => `k${i}`);
+    const patterns = Object.fromEntries(names.map((k) => [k, {}]));
+    const objects = names.map(() => ({}));
+
+    const started = performance.now();
+    const violations = validateSchema(
+      { items: { patternProperties: patterns } },
+      objects
+    );
+    const elapsed = performance.now() - started;
+
+    expect(violations).toEqual([]);
+    // Reading the 16,000 patterns for each of 16,000 objects took 4 seconds.
+    expect(elapsed).toBeLessThan(250);
+  });
+
+  it("stops at once when its step budget runs out", () => {
+    const names = Array.from({ length: 16_000 }, (_, i) => `k${i}`);
+    const value = Object.fromEntries(names.map((k) => [k, 1]));
+    const patterns = Object.fromEntries(names.map((k) => [`(${k}+)+`, {}]));
+
+    const started = performance.now();
+    const violations = validateSchema({ patternProperties: patterns }, value);
+    const elapsed = performance.now() - started;
+
+    expect(violations).toEqual([
+      { path: "$", keyword: "budget", message: "is too complex to validate" },
+    ]);
+    // Going on past the budget took 2 seconds here.
+    expect(elapsed).toBeLessThan(250);
+  });
+
+  it("checks if, then, and else", () => {
+    const schema = {
+      if: { properties: { kind: { const: "email" } }, required: ["kind"] },
+      then: {
+        properties: { to: { pattern: "@acme\\.com$" } },
+        required: ["to"],
+      },
+      else: { required: ["url"] },
+    };
+
+    expect(validateSchema(schema, { kind: "email", to: "a@acme.com" })).toEqual(
+      []
+    );
+    expect(validateSchema(schema, { kind: "web", url: "https://a" })).toEqual(
+      []
+    );
+    expect(validateSchema(schema, { kind: "email", to: "x@evil.com" })).toEqual([
+      { path: "$.to", keyword: "pattern", message: "must match the pattern" },
+    ]);
+    expect(validateSchema(schema, { kind: "web" })).toEqual([
+      { path: "$.url", keyword: "required", message: "is required" },
+    ]);
+    expect(validateSchema({ then: { required: ["a"] } }, {})).toEqual([]);
+  });
+
+  it("reports a key that propertyNames refuses without its name", () => {
+    expect(
+      validateSchema({ propertyNames: { pattern: "^[a-z]+$" } }, { [TOKEN]: 1 })
+    ).toEqual([
+      {
+        path: "$.*",
+        keyword: "propertyNames",
+        message: "has a key that doesn't match propertyNames",
+      },
+    ]);
   });
 
   it("treats a property set to undefined as missing", () => {
@@ -796,6 +994,31 @@ describe("validateSchema", () => {
         keyword: "depth",
         message: "is nested deeper than 64 levels",
       },
+    ]);
+  });
+
+  it("counts allOf, anyOf, oneOf, not, and if as nesting, and refuses too many rather than overflow the stack", () => {
+    const wrap = (levels: number) => {
+      let schema: Record<string, unknown> = { type: "string" };
+      for (let i = 0; i < levels; i++) {
+        schema = [
+          { allOf: [schema] },
+          { anyOf: [schema] },
+          { oneOf: [schema] },
+          { not: { not: schema } },
+          { if: true, then: schema },
+        ][i % 5];
+      }
+      return { type: "object", properties: { a: schema } };
+    };
+
+    expect(validateSchema(wrap(100), { a: "x" })).toEqual([]);
+    expect(validateSchema(wrap(100), { a: 1 }).length).toBeGreaterThan(0);
+    expect(validateSchema(wrap(600), { a: "x" })).toEqual([
+      { path: "$", keyword: "budget", message: "is too complex to validate" },
+    ]);
+    expect(validateSchema(wrap(20_000), { a: "x" })).toEqual([
+      { path: "$", keyword: "budget", message: "is too complex to validate" },
     ]);
   });
 

@@ -28,7 +28,11 @@ import { decodeTextBlob, isRecord, withOverrides } from "./shared";
 export interface ShieldMcpOptions
   extends Pick<
     ShieldProviderOptions,
-    "detect" | "scanToolResults" | "onDetection" | "onInjectionDetected"
+    | "detect"
+    | "scanToolResults"
+    | "onDetection"
+    | "onInjectionDetected"
+    | "requireFullCoverage"
   > {
   /**
    * Options for checking the tools `listTools` returns with `scanTools`, or
@@ -73,21 +77,25 @@ export interface ShieldMcpOptions
    * A tool policy from `createToolPolicy()`, for one session. The tools
    * `listTools` returns are declared to it, as this client's own, `callTool`
    * runs `policy.checkAsync()` before the server is called and throws
-   * `ToolPolicyError` when the policy refuses the call, and each tool result
-   * is recorded with `policy.recordResult()`, flagged when detection found an
-   * injection in it. A resource or prompt with an injection is recorded
-   * with `policy.recordUntrusted()`. Default: none.
+   * `ToolPolicyError` when the policy refuses the call, and each tool result,
+   * or error the call failed with, is recorded with `policy.recordResult()`,
+   * flagged when detection found an injection in it. A resource, a prompt,
+   * or a task result read by its task ID, or its error, with an injection
+   * is recorded with `policy.recordUntrusted()`. Default: none.
    */
   policy?: ToolPolicy;
 }
 
-/** Text of tool call arguments for the output detectors, up to 64KB. */
+/**
+ * Text of tool call arguments for the output detectors, all of it: they
+ * run in linear time, and a cut would let padding hide what follows it.
+ */
 function argumentText(args: unknown): string {
   if (typeof args === "string") {
-    return args.slice(0, 65_536);
+    return args;
   }
   try {
-    return (JSON.stringify(args) ?? "").slice(0, 65_536);
+    return JSON.stringify(args) ?? "";
   } catch {
     return "";
   }
@@ -115,7 +123,7 @@ function resourceText(resource: unknown): string {
     : decodeTextBlob(resource.blob, resource.mimeType);
 }
 
-/** Text a model reads from a content block: text, an embedded resource, or a resource link's title and description. */
+/** Text a model reads from a content block: text, an embedded resource, or a resource link's name, title, and description. */
 function blockText(block: unknown): string {
   if (!isRecord(block)) {
     return "";
@@ -126,7 +134,9 @@ function blockText(block: unknown): string {
     case "resource":
       return resourceText(block.resource);
     case "resource_link":
-      return [block.title, block.description].filter(isString).join("\n");
+      return [block.name, block.title, block.description]
+        .filter(isString)
+        .join("\n");
     default:
       return "";
   }
@@ -139,8 +149,8 @@ function joined(texts: string[]): string {
 const list = (value: unknown): unknown[] => (Array.isArray(value) ? value : []);
 
 /**
- * Text of a tool call result: its content blocks, the strings in its
- * structured content, and a legacy `toolResult`.
+ * Text of a tool call result: its content blocks, the keys and strings in
+ * its structured content, and a legacy `toolResult`.
  */
 function toolResultText(result: unknown): string {
   if (!isRecord(result)) {
@@ -154,6 +164,17 @@ function toolResultText(result: unknown): string {
     texts.push(jsonText(result.toolResult));
   }
   return joined(texts);
+}
+
+/** Text of an error a call failed with: its message, and the keys and strings in its data. */
+function errorText(error: unknown): string {
+  if (!isRecord(error)) {
+    return typeof error === "string" ? error : "";
+  }
+  return joined([
+    typeof error.message === "string" ? error.message : "",
+    error.data === undefined ? "" : jsonText(error.data),
+  ]);
 }
 
 function resourcesText(result: unknown): string {
@@ -175,6 +196,12 @@ function promptText(result: unknown): string {
     ...texts,
   ]);
 }
+
+const methodOf = (request: unknown): unknown =>
+  isRecord(request) ? request.method : undefined;
+
+const paramsOf = (request: unknown): unknown =>
+  isRecord(request) ? request.params : undefined;
 
 function isFlagged(scan: ToolScanResult): boolean {
   return scan.result.detected || scan.issues.length > 0;
@@ -214,8 +241,6 @@ function toolScanOptions(options: ShieldMcpOptions): ScanToolsOptions | null {
   return options.detect || {};
 }
 
-type Method = (...args: unknown[]) => Promise<unknown>;
-
 /** Tells apart the tools each wrapped client declares to a shared policy. */
 let policySources = 0;
 
@@ -226,12 +251,37 @@ interface McpClient {
   getPrompt(...args: unknown[]): unknown;
 }
 
+/** The SDK's `client.experimental.tasks`, which calls tools as tasks. */
+interface McpTasks {
+  callToolStream(...args: unknown[]): AsyncIterable<unknown>;
+  requestStream(...args: unknown[]): AsyncIterable<unknown>;
+  getTaskResult(...args: unknown[]): unknown;
+}
+
+/** The other ways the SDK's `Client` sends a request, which older SDKs lack. */
+interface SdkClient extends McpClient {
+  request?(...args: unknown[]): unknown;
+  requestStream?(...args: unknown[]): AsyncIterable<unknown>;
+  getTaskResult?(...args: unknown[]): unknown;
+  experimental?: { tasks?: McpTasks };
+}
+
+/** How what a request returns, or the error it fails with, is checked. */
+interface Check {
+  /** Checks a result, and returns it or what to return in its place. */
+  result(value: unknown): Promise<unknown>;
+  /** Checks an error, and throws in its place when it blocks. */
+  error(value: unknown): Promise<void>;
+}
+
 /**
  * Wraps an MCP `Client` so tool lists are checked for tool poisoning and
  * flagged tools are dropped, and tool results, resources, and prompts are
  * checked for injection like tool results in the other wrappers. With
  * `policy`, every tool call must pass a tool policy from
- * `createToolPolicy()` before the server is called.
+ * `createToolPolicy()` before the server is called. A tool call is checked
+ * the same whichever way the SDK sends it: `callTool`, `request`, or
+ * `experimental.tasks.callToolStream`, which throws while it is read.
  *
  * @example
  * ```ts
@@ -267,12 +317,12 @@ export function shieldMcpClient<
   const blocking = (options.onDetection ?? "block") === "block";
 
   /** Declares the tools a list returned; a page fetched with a cursor adds to the pages before it. */
-  const declare = (tools: unknown[], args: unknown[]): void => {
+  const declare = (tools: unknown[], params: unknown): void => {
     if (!policy) {
       return;
     }
     const page = tools.filter(isRecord) as ToolDefinition[];
-    const nextPage = isRecord(args[0]) && typeof args[0].cursor === "string";
+    const nextPage = isRecord(params) && typeof params.cursor === "string";
     declared = nextPage ? [...declared, ...page] : page;
     policy.declareTools(declared, policySource);
   };
@@ -302,7 +352,18 @@ export function shieldMcpClient<
   ): Promise<DetectResult | undefined> =>
     input.tool ? await input.inspect(textOf(result), "tool") : undefined;
 
-  const throwIfBlocking = (detection: DetectResult | undefined): void => {
+  /**
+   * Checks the text `textOf` finds in a result, or in the error a call failed
+   * with, as a tool result: tells `record` whether detection flagged it, and
+   * throws `InjectionDetectedError` when the detection blocks.
+   */
+  const review = async (
+    value: unknown,
+    textOf: (value: unknown) => string,
+    record: (flagged: boolean) => void
+  ): Promise<void> => {
+    const detection = await inspect(value, textOf);
+    record(Boolean(detection?.detected));
     if (detection?.detected && blocking) {
       throw new InjectionDetectedError(
         detection.risk,
@@ -312,31 +373,38 @@ export function shieldMcpClient<
     }
   };
 
-  /** Calls `method` and checks the text `textOf` finds in its result as a tool result. */
-  const checked =
-    (
-      method: Method,
-      textOf: (result: unknown) => string,
-      source: string
-    ): Method =>
-    async (...args) => {
-      const result = await method(...args);
-      const detection = await inspect(result, textOf);
-      if (detection?.detected) {
+  /** Records a resource or prompt with an injection as untrusted content from `source`. */
+  const untrusted =
+    (source: string) =>
+    (flagged: boolean): void => {
+      if (flagged) {
         policy?.recordUntrusted(source);
       }
-      throwIfBlocking(detection);
-      return result;
     };
 
-  const listTools: Method = async (...args) => {
-    const result = await client.listTools(...args);
+  /** Checks result and error text for injection, as `review` does. */
+  const injectionCheck = (
+    textOf: (value: unknown) => string,
+    record: (flagged: boolean) => void
+  ): Check => ({
+    async result(value) {
+      await review(value, textOf, record);
+      return value;
+    },
+    error: (value) => review(value, errorText, record),
+  });
+
+  /** Checks a tool list for poisoned tools, and returns it with the flagged ones dropped. */
+  const screenTools = async (
+    result: unknown,
+    params: unknown
+  ): Promise<unknown> => {
     if (!(isRecord(result) && Array.isArray(result.tools))) {
       return result;
     }
     const tools: unknown[] = result.tools;
     if (!scanOptions) {
-      declare(tools, args);
+      declare(tools, params);
       return result;
     }
     const scans = (
@@ -358,7 +426,7 @@ export function shieldMcpClient<
       }
     }
     pinNew(clean);
-    declare(mode === "warn" ? tools : clean, args);
+    declare(mode === "warn" ? tools : clean, params);
     if (flagged.size === 0 || mode === "warn") {
       return result;
     }
@@ -368,16 +436,21 @@ export function shieldMcpClient<
     return { ...result, tools: tools.filter((_, i) => !flagged.has(i)) };
   };
 
-  const callTool: Method = async (...args) => {
-    const params = isRecord(args[0]) ? args[0] : undefined;
-    const name = typeof params?.name === "string" ? params.name : "";
+  /**
+   * Checks a tool call before the server is called: the tool is not
+   * flagged, its arguments carry no credential or exfiltration link, and
+   * the policy allows it. Returns the check for its result.
+   */
+  const beginCall = async (params: unknown): Promise<Check> => {
+    const call = isRecord(params) ? params : undefined;
+    const name = typeof call?.name === "string" ? call.name : "";
     const flaggedScan = blockCalls ? flaggedByName.get(name) : undefined;
     if (flaggedScan) {
       throw flaggedToolsError([flaggedScan]);
     }
-    if (argumentOptions && params && params.arguments !== undefined) {
+    if (argumentOptions && call && call.arguments !== undefined) {
       const scan = scanOutputText(
-        argumentText(params.arguments),
+        argumentText(call.arguments),
         argumentOptions
       );
       const high = scan.findings.filter((f) => atLeast(f.severity, "high"));
@@ -388,32 +461,133 @@ export function shieldMcpClient<
     if (policy) {
       const decision = await policy.checkAsync({
         name,
-        arguments: params?.arguments,
+        arguments: call?.arguments,
         source: policySource,
       });
       if (!decision.allowed) {
         throw new ToolPolicyError(decision);
       }
     }
-    const result = await client.callTool(...args);
-    const detection = await inspect(result, toolResultText);
-    policy?.recordResult(name, { flagged: Boolean(detection?.detected) });
-    throwIfBlocking(detection);
-    return result;
+    return injectionCheck(toolResultText, (flagged) =>
+      policy?.recordResult(name, { flagged })
+    );
   };
 
-  return withOverrides(client, {
-    listTools,
-    callTool,
-    readResource: checked(
-      async (...args) => await client.readResource(...args),
-      resourcesText,
-      "readResource"
-    ),
-    getPrompt: checked(
-      async (...args) => await client.getPrompt(...args),
-      promptText,
-      "getPrompt"
-    ),
-  });
+  /**
+   * Runs what a request with MCP method `method` must pass before it is
+   * sent, and returns the check for what it returns, or `undefined` for a
+   * method that has none. Every way the client sends a request comes here,
+   * so a tool call is checked the same whichever one sends it.
+   */
+  const begin = async (
+    method: unknown,
+    params: unknown
+  ): Promise<Check | undefined> => {
+    switch (method) {
+      case "tools/list":
+        return {
+          result: (value) => screenTools(value, params),
+          error: async () => undefined,
+        };
+      case "tools/call":
+        return await beginCall(params);
+      case "resources/read":
+        return injectionCheck(resourcesText, untrusted("readResource"));
+      case "prompts/get":
+        return injectionCheck(promptText, untrusted("getPrompt"));
+      case "tasks/result":
+        return injectionCheck(toolResultText, untrusted("getTaskResult"));
+      default:
+        return;
+    }
+  };
+
+  /**
+   * Sends a request with MCP method `method` through `send`, and checks what
+   * it returns or the error it fails with, which a server writes as freely
+   * as a result. An error is rethrown as it is unless its injection blocks.
+   */
+  const sent = async (
+    method: unknown,
+    params: unknown,
+    send: () => unknown
+  ): Promise<unknown> => {
+    const check = await begin(method, params);
+    if (!check) {
+      return await send();
+    }
+    let result: unknown;
+    try {
+      result = await send();
+    } catch (error) {
+      await check.error(error);
+      throw error;
+    }
+    return await check.result(result);
+  };
+
+  /** Streams the messages of a request opened with `open`, checking its result or error as `sent` does. */
+  async function* streamed(
+    method: unknown,
+    params: unknown,
+    open: () => AsyncIterable<unknown>
+  ): AsyncGenerator<unknown> {
+    const check = await begin(method, params);
+    for await (const message of open()) {
+      if (check && isRecord(message) && message.type === "result") {
+        const result = await check.result(message.result);
+        yield result === message.result ? message : { ...message, result };
+        continue;
+      }
+      if (check && isRecord(message) && message.type === "error") {
+        await check.error(message.error);
+      }
+      yield message;
+    }
+  }
+
+  const overrides: Record<string, unknown> = {
+    listTools: (...args: unknown[]) =>
+      sent("tools/list", args[0], () => client.listTools(...args)),
+    callTool: (...args: unknown[]) =>
+      sent("tools/call", args[0], () => client.callTool(...args)),
+    readResource: (...args: unknown[]) =>
+      sent("resources/read", args[0], () => client.readResource(...args)),
+    getPrompt: (...args: unknown[]) =>
+      sent("prompts/get", args[0], () => client.getPrompt(...args)),
+  };
+  const sdk: SdkClient = client;
+  if (sdk.request) {
+    const request = sdk.request.bind(client);
+    overrides.request = (...args: unknown[]) =>
+      sent(methodOf(args[0]), paramsOf(args[0]), () => request(...args));
+  }
+  if (sdk.requestStream) {
+    const requestStream = sdk.requestStream.bind(client);
+    overrides.requestStream = (...args: unknown[]) =>
+      streamed(methodOf(args[0]), paramsOf(args[0]), () =>
+        requestStream(...args)
+      );
+  }
+  if (sdk.getTaskResult) {
+    const getTaskResult = sdk.getTaskResult.bind(client);
+    overrides.getTaskResult = (...args: unknown[]) =>
+      sent("tasks/result", args[0], () => getTaskResult(...args));
+  }
+  const tasks = sdk.experimental?.tasks;
+  if (sdk.experimental && tasks) {
+    overrides.experimental = withOverrides(sdk.experimental, {
+      tasks: withOverrides(tasks, {
+        callToolStream: (...args: unknown[]) =>
+          streamed("tools/call", args[0], () => tasks.callToolStream(...args)),
+        requestStream: (...args: unknown[]) =>
+          streamed(methodOf(args[0]), paramsOf(args[0]), () =>
+            tasks.requestStream(...args)
+          ),
+        getTaskResult: (...args: unknown[]) =>
+          sent("tasks/result", args[0], () => tasks.getTaskResult(...args)),
+      }),
+    });
+  }
+  return withOverrides(client, overrides);
 }
