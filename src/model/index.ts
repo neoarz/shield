@@ -66,9 +66,10 @@ const HIGH_RISK_SCORE = 0.9;
 /** Windows scored at most when `windows` is on. */
 const MAX_WINDOWS = 32;
 /**
- * A text too long for its windows is read at both ends: the first windows,
- * and this many windows ending where the text ends, so that an instruction
- * placed at the end of a long document is still read.
+ * A text too long for its windows, or too long to scan for tokens, is read
+ * at both ends: the first windows, and this many windows ending where the
+ * text ends, so that an instruction placed at the end of a long document is
+ * still read.
  */
 const TAIL_WINDOWS = 4;
 /** Characters taken from the end of the text for its last windows, per token they need. */
@@ -90,6 +91,8 @@ const MAX_SCAN_CHARS = 64 * 1024;
  */
 const RE_BOUNDARY = /[ \t\n\r]/;
 const RE_LETTER_OR_DIGIT = /[\p{L}\p{N}]/u;
+/** A surrogate without its pair, which a native tokenizer refuses to read. */
+const RE_LONE_SURROGATE = /[\uD800-\uDFFF]/gu;
 /** A relative path transformers.js would take for a Hugging Face repo id. */
 const RE_REPO_ID_LIKE = /^[\w.-]+(?:\/[\w.-]+)?$/;
 
@@ -461,16 +464,22 @@ function windowsOf(
   return out;
 }
 
+/** `text` with each lone surrogate replaced by U+FFFD, as encoding it to UTF-8 does. */
+function wellFormed(text: string): string {
+  return text.replace(RE_LONE_SURROGATE, "\ufffd");
+}
+
 function prepareWindows(
   loaded: LoadedModel,
   input: string,
   options: ModelDetectorOptions,
   profile: ModelProfile
 ): { text: string; bodies: number[][]; room: number; max: number } {
-  const text =
+  const text = wellFormed(
     options.html !== false && looksLikeHtml(input)
       ? htmlText(input).text
-      : input;
+      : input
+  );
   const maxTokens = options.maxTokens ?? profile.maxTokens;
   const body = maxTokens - loaded.head.length - loaded.tail.length;
   const windows =
@@ -482,7 +491,10 @@ function prepareWindows(
   const max = Math.max(1, windows.max ?? MAX_WINDOWS);
   const room = stride * (max - 1) + body;
   const ids = tokenize(loaded, text, room + 1);
-  if (ids.length <= room || max <= TAIL_WINDOWS) {
+  if (
+    (ids.length <= room && text.length <= MAX_SCAN_CHARS) ||
+    max <= TAIL_WINDOWS
+  ) {
     return {
       text,
       bodies: windowsOf(ids.slice(0, room), body, stride, max),
@@ -688,9 +700,12 @@ export function createModelDetector(
       options.countTokens ??
       (async (text: string): Promise<number> =>
         loaded.tokenizer.encode(text, { add_special_tokens: false }).length);
-    const inputTokens = await countTokens(input);
+    const submitted = wellFormed(input);
+    const inputTokens = await countTokens(submitted);
     const textTokens =
-      prepared.text === input ? inputTokens : await countTokens(prepared.text);
+      prepared.text === submitted
+        ? inputTokens
+        : await countTokens(prepared.text);
     signal?.throwIfAborted();
     return {
       score: await scoreBatch(loaded, prepared.bodies, signal),

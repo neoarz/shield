@@ -1,4 +1,6 @@
+import { once } from "node:events";
 import { assertCudaValidation } from "./cuda-validation";
+import type { ShieldHttpServer } from "./http";
 import {
   createLocalClassifier,
   createShieldServer,
@@ -8,14 +10,23 @@ import {
 import { InferenceGate } from "./inference-gate";
 import { createModelProcess } from "./model-process";
 
-function positiveInteger(
+/** Client disconnects cancel inference only from Bun 1.4.2 on. */
+const MIN_BUN = [1, 4, 2];
+/** The longest delay setTimeout keeps; a longer one fires at once. */
+const MAX_TIMEOUT_MS = 2_147_483_647;
+
+/** A startup error safe to print: it names what to fix, never a setting's value. */
+class ConfigurationError extends Error {}
+
+function integer(
   name: string,
   fallback: number,
+  minimum: number,
   maximum: number
 ): number {
   const value = Number(process.env[name] ?? fallback);
-  if (!Number.isSafeInteger(value) || value < 1 || value > maximum) {
-    throw new Error("Invalid server configuration");
+  if (!Number.isSafeInteger(value) || value < minimum || value > maximum) {
+    throw new ConfigurationError(`Invalid ${name}`);
   }
   return value;
 }
@@ -24,15 +35,29 @@ function capacityOptions(): Omit<
   ShieldServerOptions,
   "classifier" | "bearerToken"
 > {
+  const size = (name: string, fallback: number, minimum = 1): number =>
+    integer(name, fallback, minimum, Number.MAX_SAFE_INTEGER);
+  const delay = (name: string, fallback: number): number =>
+    integer(name, fallback, 1, MAX_TIMEOUT_MS);
   return {
-    concurrency: Number(process.env.SHIELD_CONCURRENCY ?? 1),
-    gpuConcurrency: Number(process.env.SHIELD_GPU_CONCURRENCY ?? 1),
-    maxQueue: Number(process.env.SHIELD_MAX_QUEUE ?? 8),
-    queueTimeoutMs: Number(process.env.SHIELD_QUEUE_TIMEOUT_MS ?? 5000),
-    requestTimeoutMs: Number(process.env.SHIELD_REQUEST_TIMEOUT_MS ?? 24_000),
-    uploadTimeoutMs: Number(process.env.SHIELD_UPLOAD_TIMEOUT_MS ?? 5000),
-    maxUploads: Number(process.env.SHIELD_MAX_UPLOADS ?? 16),
+    concurrency: size("SHIELD_CONCURRENCY", 1),
+    gpuConcurrency: size("SHIELD_GPU_CONCURRENCY", 1),
+    maxQueue: size("SHIELD_MAX_QUEUE", 8, 0),
+    queueTimeoutMs: delay("SHIELD_QUEUE_TIMEOUT_MS", 5000),
+    requestTimeoutMs: delay("SHIELD_REQUEST_TIMEOUT_MS", 24_000),
+    uploadTimeoutMs: delay("SHIELD_UPLOAD_TIMEOUT_MS", 5000),
+    maxUploads: size("SHIELD_MAX_UPLOADS", 16),
   };
+}
+
+function supportedBun(version: string): boolean {
+  const parts = version.split(".").map((part) => Number.parseInt(part, 10));
+  for (let i = 0; i < MIN_BUN.length; i++) {
+    if (parts[i] !== MIN_BUN[i]) {
+      return parts[i] > MIN_BUN[i];
+    }
+  }
+  return true;
 }
 
 async function main(): Promise<void> {
@@ -40,7 +65,9 @@ async function main(): Promise<void> {
   const bearerToken = process.env.SHIELD_PRIVATE_TOKEN;
   const pythonPath = process.env.SHIELD_TOKENIZER_PYTHON;
   if (!(manifestPath && pythonPath && bearerToken) || bearerToken.length < 32) {
-    throw new Error("Missing manifest or private token");
+    throw new ConfigurationError(
+      "Missing SHIELD_ARTIFACT_MANIFEST, SHIELD_TOKENIZER_PYTHON, or a SHIELD_PRIVATE_TOKEN of at least 32 characters"
+    );
   }
   const pool = process.env.SHIELD_POOL ?? "paid";
   const largeDevice = process.env.SHIELD_LARGE_DEVICE ?? "cpu";
@@ -49,23 +76,34 @@ async function main(): Promise<void> {
     (largeDevice !== "cpu" && largeDevice !== "cuda") ||
     (pool === "free" && largeDevice !== "cpu")
   ) {
-    throw new Error("Invalid serving pool or device");
+    throw new ConfigurationError("Invalid SHIELD_POOL or SHIELD_LARGE_DEVICE");
+  }
+  if (largeDevice === "cuda" && process.env.NVIDIA_TF32_OVERRIDE !== "0") {
+    throw new ConfigurationError(
+      "CUDA serving requires full-precision matmul settings (NVIDIA_TF32_OVERRIDE=0)"
+    );
+  }
+  const threads = integer("SHIELD_THREADS", 2, 1, 256);
+  const port = integer("SHIELD_PORT", 8789, 1, 65_535);
+  const healthPort = integer("SHIELD_HEALTH_PORT", 8790, 1, 65_535);
+  if (healthPort === port) {
+    throw new ConfigurationError(
+      "The readiness listener requires its own SHIELD_HEALTH_PORT"
+    );
+  }
+  const capacity = capacityOptions();
+  const bun = process.versions.bun;
+  if (bun !== undefined && !supportedBun(bun)) {
+    throw new ConfigurationError(
+      `Bun ${bun} does not cancel inference when a client disconnects; run Bun 1.4.2 or later`
+    );
   }
   const manifest = await loadArtifactManifest(manifestPath, { pool });
   if (largeDevice === "cuda") {
-    if (process.env.NVIDIA_TF32_OVERRIDE !== "0") {
-      throw new Error("CUDA serving requires full-precision matmul settings");
-    }
     await assertCudaValidation(
       process.env.SHIELD_CUDA_VALIDATION_REPORT,
       manifest
     );
-  }
-  const threads = positiveInteger("SHIELD_THREADS", 2, 256);
-  const port = positiveInteger("SHIELD_PORT", 8789, 65_535);
-  const healthPort = positiveInteger("SHIELD_HEALTH_PORT", 8790, 65_535);
-  if (healthPort === port) {
-    throw new Error("The readiness listener requires its own port");
   }
   const cpuGates = {
     direct: new InferenceGate(),
@@ -85,15 +123,24 @@ async function main(): Promise<void> {
         gate: model.device === "cuda" ? undefined : cpuGates[lane],
       }),
   });
-  const server = createShieldServer({
-    classifier,
-    bearerToken,
-    ...capacityOptions(),
-  });
-  // The default binding cannot receive public traffic. Private network use is explicit.
-  const bind = process.env.SHIELD_BIND ?? "127.0.0.1";
-  server.listen(port, bind);
-  server.readiness.listen(healthPort, bind);
+  let server: ShieldHttpServer | undefined;
+  try {
+    server = createShieldServer({ classifier, bearerToken, ...capacity });
+    // The default binding cannot receive public traffic. Private network use is explicit.
+    const bind = process.env.SHIELD_BIND ?? "127.0.0.1";
+    server.listen(port, bind);
+    server.readiness.listen(healthPort, bind);
+    await Promise.all([
+      once(server, "listening"),
+      once(server.readiness, "listening"),
+    ]);
+  } catch (error) {
+    // Running model workers would keep this process alive with nothing listening.
+    server?.close();
+    server?.readiness.close();
+    await classifier.close?.();
+    throw error;
+  }
   let stopping = false;
   const stop = async (): Promise<void> => {
     if (stopping) {
@@ -114,9 +161,11 @@ async function main(): Promise<void> {
   process.once("SIGINT", onStop);
 }
 
-main().catch(() => {
+main().catch((error: unknown) => {
   process.stderr.write(
-    "Shield private server failed to start; verify local artifacts and configuration.\n"
+    error instanceof ConfigurationError
+      ? `Shield private server failed to start: ${error.message}.\n`
+      : "Shield private server failed to start; verify local artifacts and configuration.\n"
   );
   process.exitCode = 1;
 });

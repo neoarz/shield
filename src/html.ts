@@ -196,9 +196,12 @@ function decodeEntities(s: string): string {
   return s.replace(RE_ENTITY, (whole, dec, hex, name) => {
     if (dec || hex) {
       const code = Number.parseInt(dec ?? hex, dec ? 10 : 16);
-      return code > 0 && code <= 0x10_ff_ff
-        ? String.fromCodePoint(code)
-        : whole;
+      // As browsers do: NUL, surrogates, and values past U+10FFFF become U+FFFD.
+      return code === 0 ||
+        (code >= 0xd8_00 && code <= 0xdf_ff) ||
+        code > 0x10_ff_ff
+        ? "\ufffd"
+        : String.fromCodePoint(code);
     }
     return NAMED[name.toLowerCase()] ?? whole;
   });

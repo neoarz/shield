@@ -17,6 +17,7 @@ export type WorkerEvent =
   | { type: "ready" }
   | { type: "result"; id: number; result: ModelScoreDetails }
   | { type: "error"; id: number; cancelled: boolean }
+  | { type: "rejected"; id: number }
   | { type: "acquire"; id: number; gateId: number }
   | { type: "release"; gateId: number }
   | { type: "fatal" };
@@ -60,6 +61,8 @@ export function isWorkerEvent(value: unknown): value is WorkerEvent {
       return identifier(value.id) && scoreDetails(value.result);
     case "error":
       return identifier(value.id) && typeof value.cancelled === "boolean";
+    case "rejected":
+      return identifier(value.id);
     case "acquire":
       return identifier(value.id) && identifier(value.gateId);
     case "release":

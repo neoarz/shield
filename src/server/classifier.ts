@@ -10,6 +10,7 @@ import {
 } from "../model";
 import type { ArtifactManifest, ServingPool } from "./artifacts";
 import type { WorkerModelOptions } from "./model-worker-protocol";
+import { RequestError } from "./request-error";
 import { createTokenCounter, type TokenCounter } from "./tokenizer";
 
 export const SHIELD_MODELS = [
@@ -315,7 +316,13 @@ export async function createLocalClassifier(
           ...(spans.length > 0 ? { attack_spans: spans } : {}),
         };
       } catch (error) {
-        if (!(signal?.aborted && error === signal.reason)) {
+        // A refused input fails its own request, not the models.
+        if (
+          !(
+            (signal?.aborted && error === signal.reason) ||
+            error instanceof RequestError
+          )
+        ) {
           healthy = false;
         }
         throw error;

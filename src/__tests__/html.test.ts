@@ -2,6 +2,8 @@ import { describe, expect, it } from "vitest";
 import { detect } from "../detect";
 import { htmlText, looksLikeHtml } from "../html";
 
+const RE_LONE_SURROGATE = /[\uD800-\uDFFF]/u;
+
 const page = (body: string, head = "") =>
   `<html><head><title>Store</title>${head}</head><body><div class="nav"><a href="/">Home</a><a href="/cart">Cart</a></div><div class="main"><h1>Blue mug</h1><p>Ceramic, 350 ml.</p><span>In stock</span></div>${body}<footer><p>&copy; 2026 Store</p></footer></body></html>`;
 
@@ -43,6 +45,16 @@ describe("htmlText", () => {
     expect(hidden).toContain("icon");
     expect(hidden).not.toContain("Shown");
     expect(text).toContain("Shown");
+  });
+
+  it("decodes numeric references as a browser does, never to a lone surrogate", () => {
+    const { text } = htmlText(
+      page(
+        '<p title="Note &#xDBFF;">&#xD800; &#55296; &#xDFFF; &#0; &#x110000; &#9999999; &#x41;&#66;</p>'
+      )
+    );
+    expect(text).toContain("\ufffd \ufffd \ufffd \ufffd \ufffd \ufffd AB");
+    expect(text).not.toMatch(RE_LONE_SURROGATE);
   });
 
   it("handles broken markup in linear time", () => {

@@ -343,6 +343,32 @@ describe("private inference HTTP boundary", () => {
     });
   });
 
+  it("accepts the bearer scheme in any letter case", async () => {
+    const url = await serve({
+      revision: "revision",
+      classify: async () => RESULT,
+    });
+    const health = (authorization: string) =>
+      fetch(`${url}/healthz`, { headers: { authorization } });
+    for (const scheme of ["bearer", "BEARER", "bEaReR"]) {
+      expect((await health(`${scheme} ${TOKEN}`)).status).toBe(200);
+    }
+    for (const authorization of [`bearer ${TOKEN}x`, `Basic ${TOKEN}`, TOKEN]) {
+      expect((await health(authorization)).status).toBe(401);
+    }
+  });
+
+  it("refuses request limits that are not positive integers", () => {
+    const classifier = { revision: "revision", classify: async () => RESULT };
+    for (const limit of ["maxBodyBytes", "maxInputLength", "maxBatchSize"]) {
+      for (const value of [Number.NaN, 0, -1, 1.5, Number.POSITIVE_INFINITY]) {
+        expect(() =>
+          createShieldServer({ classifier, bearerToken: TOKEN, [limit]: value })
+        ).toThrow("Invalid server request limit");
+      }
+    }
+  });
+
   it("validates batches, size, and model before inference", async () => {
     const classify = vi.fn(async () => RESULT);
     const url = await serve(

@@ -4,6 +4,7 @@ import {
   type WorkerEvent,
   type WorkerModelOptions,
 } from "./model-worker-protocol";
+import { RequestError } from "./request-error";
 import { createTokenCounter, type TokenCounter } from "./tokenizer";
 
 interface Request {
@@ -93,11 +94,15 @@ function score(id: number, input: string): void {
       const result = await model.scoreDetails(input, abort.signal);
       send({ type: "result", id, result });
     } catch (error) {
-      send({
-        type: "error",
-        id,
-        cancelled: abort.signal.aborted && error === abort.signal.reason,
-      });
+      if (error instanceof RequestError) {
+        send({ type: "rejected", id });
+      } else {
+        send({
+          type: "error",
+          id,
+          cancelled: abort.signal.aborted && error === abort.signal.reason,
+        });
+      }
     } finally {
       requests.delete(id);
     }

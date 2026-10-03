@@ -91,6 +91,17 @@ describe("isolated native model processes", () => {
     await expect(model.score("hello")).rejects.toThrow("unavailable");
   });
 
+  it("fails only the request whose input the tokenizer refused", async () => {
+    const model = create(new InferenceGate());
+    await model.load();
+    await expect(model.score("reject")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_input",
+    });
+    expect(model.ready?.()).toBe(true);
+    await expect(model.score("hello")).resolves.toBe(0.25);
+  });
+
   it("releases the shared CPU slot when a model process crashes", async () => {
     const gate = new InferenceGate();
     const crashed = create(gate);

@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import { isAbsolute } from "node:path";
 import { createInterface } from "node:readline";
+import { RequestError } from "./request-error";
 
 // Native tokenizers avoids transformers.js's quadratic full-text token counting.
 // Request text exists only in the process pipe and memory; nothing is written to disk.
@@ -12,8 +13,11 @@ tokenizer.no_padding()
 tokenizer.no_truncation()
 print("ready", flush=True)
 for line in sys.stdin:
-    text = json.loads(line)
-    print(len(tokenizer.encode(text, add_special_tokens=False).ids), flush=True)
+    try:
+        count = len(tokenizer.encode(json.loads(line), add_special_tokens=False).ids)
+    except Exception:
+        count = "invalid"
+    print(count, flush=True)
 `;
 export interface TokenCounter {
   count(text: string): Promise<number>;
@@ -90,7 +94,11 @@ export async function createTokenCounter(
       const result = previous.then(async () => {
         const response = receive();
         child.stdin.write(`${JSON.stringify(text)}\n`);
-        const value = Number(await response);
+        const line = await response;
+        if (line === "invalid") {
+          throw new RequestError(400, "invalid_input");
+        }
+        const value = Number(line);
         if (!Number.isSafeInteger(value) || value < 0) {
           close();
           throw new Error("Invalid tokenizer response");

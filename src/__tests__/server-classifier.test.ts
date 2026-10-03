@@ -9,6 +9,7 @@ const state = vi.hoisted(() => ({
   loaded: [] as { localPath: string; device?: string }[],
   tokenizerReady: true,
   failInference: false,
+  rejectInput: false,
   abortOnFailure: undefined as AbortController | undefined,
 }));
 vi.mock("../server/tokenizer", () => ({
@@ -31,6 +32,11 @@ vi.mock("../model", async (original) => {
       score: async () => 0.1,
       scoreDetails: (_input: string, signal?: AbortSignal) => {
         signal?.throwIfAborted();
+        if (state.rejectInput) {
+          return import("../server/request-error").then(({ RequestError }) => {
+            throw new RequestError(400, "invalid_input");
+          });
+        }
         if (state.failInference) {
           state.abortOnFailure?.abort();
           throw new Error("Model unavailable");
@@ -73,6 +79,7 @@ describe("release serving configuration", () => {
     state.calls = [];
     state.tokenizerReady = true;
     state.failInference = false;
+    state.rejectInput = false;
     state.abortOnFailure = undefined;
   });
 
@@ -120,6 +127,22 @@ describe("release serving configuration", () => {
       "unavailable"
     );
     expect(classifier.ready?.()).toBe(false);
+  });
+
+  it("keeps serving after the tokenizer refuses one input", async () => {
+    const classifier = await createLocalClassifier(manifest, {
+      pythonPath: "/test/python",
+    });
+    state.rejectInput = true;
+    await expect(classifier.classify("shield", "Hello")).rejects.toMatchObject({
+      status: 400,
+      code: "invalid_input",
+    });
+    expect(classifier.ready?.()).toBe(true);
+    state.rejectInput = false;
+    await expect(classifier.classify("shield", "Hello")).resolves.toMatchObject(
+      { score: 0.5 }
+    );
   });
 
   it("cancellation does not poison readiness and close prevents more inference", async () => {

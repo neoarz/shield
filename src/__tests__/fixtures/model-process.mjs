@@ -7,6 +7,10 @@ let nextGate = 0;
 let descendant;
 
 async function score(id, input) {
+  if (input === "reject") {
+    process.send({ type: "rejected", id });
+    return;
+  }
   const request = { cancelled: false };
   requests.set(id, request);
   const gateId = ++nextGate;

@@ -34,6 +34,9 @@ export interface ShieldHttpServer extends Server {
   drain(): Promise<void>;
 }
 
+/** Authentication schemes are case-insensitive (RFC 7235). */
+const RE_BEARER_SCHEME = /^bearer /i;
+
 function json(response: ServerResponse, status: number, value: unknown): void {
   if (response.destroyed || response.writableEnded) {
     return;
@@ -52,6 +55,13 @@ function json(response: ServerResponse, status: number, value: unknown): void {
 function timeout(value: number): number {
   if (!Number.isSafeInteger(value) || value < 1) {
     throw new Error("Invalid server deadline");
+  }
+  return value;
+}
+
+function limit(value: number): number {
+  if (!Number.isSafeInteger(value) || value < 1) {
+    throw new Error("Invalid server request limit");
   }
   return value;
 }
@@ -112,6 +122,9 @@ export function createShieldServer(
   const queueTimeout = timeout(options.queueTimeoutMs ?? 5000);
   const requestTimeout = timeout(options.requestTimeoutMs ?? 24_000);
   const uploadTimeout = timeout(options.uploadTimeoutMs ?? 5000);
+  const maxBodyBytes = limit(options.maxBodyBytes ?? 2 * 1024 * 1024);
+  const maxInputLength = limit(options.maxInputLength ?? 200_000);
+  const maxBatchSize = limit(options.maxBatchSize ?? 32);
   const cpu = new Capacity(
     options.concurrency ?? 1,
     options.maxQueue ?? 8,
@@ -160,18 +173,14 @@ export function createShieldServer(
       try {
         value = await readBody(
           request,
-          options.maxBodyBytes ?? 2 * 1024 * 1024,
+          maxBodyBytes,
           uploadTimeout,
           abort.signal
         );
       } finally {
         releaseUpload();
       }
-      const parsed = parseRequest(
-        value,
-        options.maxBatchSize ?? 32,
-        options.maxInputLength ?? 200_000
-      );
+      const parsed = parseRequest(value, maxBatchSize, maxInputLength);
       if (!healthy()) {
         throw new RequestError(503, "inference_unavailable");
       }
@@ -202,9 +211,11 @@ export function createShieldServer(
 
   const server = createServer((request, response) => {
     const run = async (): Promise<void> => {
-      if (
-        !timingSafeEqual(expected, digest(request.headers.authorization ?? ""))
-      ) {
+      const authorization = (request.headers.authorization ?? "").replace(
+        RE_BEARER_SCHEME,
+        "Bearer "
+      );
+      if (!timingSafeEqual(expected, digest(authorization))) {
         throw new RequestError(401, "unauthorized");
       }
       switch (`${request.method} ${request.url}`) {

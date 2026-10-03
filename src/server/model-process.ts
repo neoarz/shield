@@ -9,6 +9,7 @@ import {
   type WorkerEvent,
   type WorkerModelOptions,
 } from "./model-worker-protocol";
+import { RequestError } from "./request-error";
 
 interface Pending {
   abort: AbortController;
@@ -162,7 +163,7 @@ export function createModelProcess(options: {
   };
 
   function settle(
-    value: Extract<WorkerEvent, { type: "error" | "result" }>
+    value: Extract<WorkerEvent, { type: "error" | "rejected" | "result" }>
   ): void {
     const request = pending.get(value.id);
     if (
@@ -183,6 +184,8 @@ export function createModelProcess(options: {
       }
     } else if (request.signal?.aborted) {
       request.reject(request.signal.reason);
+    } else if (value.type === "rejected") {
+      request.reject(new RequestError(400, "invalid_input"));
     } else {
       request.resolve(value.result);
     }
@@ -227,6 +230,7 @@ export function createModelProcess(options: {
         break;
       case "result":
       case "error":
+      case "rejected":
         settle(value);
         break;
       default:

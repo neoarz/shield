@@ -9,6 +9,7 @@ const SEP = 2;
 const RE_WHITESPACE = /\s+/;
 const RE_ENDS_IN_TEXT = /\S$/;
 const RE_STARTS_CLEAN = /^( \S|\n)/;
+const RE_LONE_SURROGATE = /[\uD800-\uDFFF]/u;
 
 type LoadCall = [source: string, options: Record<string, unknown>];
 
@@ -160,6 +161,20 @@ describe("createModelDetector (transformers.js mocked)", () => {
     expect(result.inputTokens).toBe(9000);
     expect(result.coverage.truncated).toBe(true);
     expect(countTokens).toHaveBeenCalledWith("hello");
+  });
+
+  it("never gives a tokenizer a lone surrogate", async () => {
+    const countTokens = vi.fn(
+      async (text: string) => text.split(RE_WHITESPACE).length
+    );
+    const detector = await create({ countTokens });
+    const tags = "<p>a</p><div>b</div><span>c</span><b>d</b>";
+    await detector.scoreDetails(`${tags}<i>&#xD800; \ud800 &#xDFFF;</i>`);
+    await detector.scoreDetails("plain \udc00 text");
+    expect(countTokens).toHaveBeenCalledTimes(3);
+    for (const text of [...countTokens.mock.calls.flat(), ...calls.pieces]) {
+      expect(text).not.toMatch(RE_LONE_SURROGATE);
+    }
   });
 
   it("selects CUDA explicitly and keeps Q4 windows unpadded", async () => {
@@ -465,6 +480,22 @@ describe("createModelDetector (transformers.js mocked)", () => {
       revision: "main",
       dtype: "fp32",
     });
+  });
+
+  it("reads the end of a text padded past the scan limit with whitespace", async () => {
+    state.logits = (ids) => logitsFor(ids.includes(1777) ? 0.99 : 0.01);
+    const detector = await create();
+    for (const padding of [" ", "\n"]) {
+      const result = await detector.scoreDetails(
+        `Please do this:${padding.repeat(70_000)}w777`
+      );
+      expect(result.score).toBeCloseTo(0.99, 6);
+      expect(result.coverage).toEqual({
+        truncated: true,
+        windows: 2,
+        maxWindows: 32,
+      });
+    }
   });
 
   it("gives detect options that use the model in place of the classifier", async () => {
